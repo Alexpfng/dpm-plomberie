@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { NavLink } from 'react-router-dom';
+import { NavLink, useLocation } from 'react-router-dom';
 import { Icons } from './Icons';
 
 export function StatusPill({ status }) {
@@ -15,7 +15,22 @@ export function StatusPill({ status }) {
   return <span className={"pill " + m.cls}><span className="dot"/>{m.label}</span>;
 }
 
+const CRM_ITEMS = [
+  { to: "/crm",             label: "Dashboard",      ic: "chart",    end: true },
+  { to: "/crm/call-queue",  label: "File d'appels",  ic: "phone"   },
+  { to: "/crm/campaigns",   label: "Campagnes",      ic: "send"    },
+  { to: "/crm/prospects",   label: "Prospects",      ic: "users"   },
+  { to: "/crm/scripts",     label: "Scripts",        ic: "quote"   },
+  { to: "/crm/emails",      label: "Emails",         ic: "mail"    },
+  { to: "/crm/analytics",   label: "Analytics",      ic: "trending"},
+  { to: "/crm/settings",    label: "Paramètres",     ic: "settings"},
+];
+
 export function Sidebar({ counts = {} }) {
+  const location = useLocation();
+  const onCrm = location.pathname.startsWith('/crm');
+  const [crmOpen, setCrmOpen] = useState(onCrm);
+
   const item = (to, id, label, ic, count) => (
     <NavLink to={to} className={({ isActive }) => "nav-item" + (isActive ? " active" : "")}>
       {ic}
@@ -23,6 +38,7 @@ export function Sidebar({ counts = {} }) {
       {count != null && <span className="count tnum">{count}</span>}
     </NavLink>
   );
+
   return (
     <aside className="sidebar">
       <div className="brand">
@@ -31,13 +47,31 @@ export function Sidebar({ counts = {} }) {
       </div>
 
       <div className="nav-label">Travail</div>
-      {item("/inbox", "inbox", "Boîte de réception", Icons.inbox, counts.inbox ?? 24)}
-      {item("/quotes", "quotes", "Devis", Icons.quote, counts.quotes ?? 7)}
-      {item("/schedule", "schedule", "Planning", Icons.calendar, counts.calendar ?? 12)}
-      {item("/clients", "clients", "Clients", Icons.users)}
       {item("/tender", "tender", "Appels d'offres", Icons.building)}
       {item("/catalog", "catalog", "Base produits", Icons.package)}
-      {item("/crm", "crm", "Prospection", Icons.trending)}
+
+      {/* Prospection — accordéon */}
+      <button
+        onClick={() => setCrmOpen(o => !o)}
+        className={"nav-item" + (onCrm ? " active" : "")}
+        style={{ width: '100%', textAlign: 'left', cursor: 'pointer', background: 'none', border: 'none', color: 'inherit', font: 'inherit' }}
+      >
+        {Icons.trending}
+        <span style={{ flex: 1 }}>Prospection</span>
+        <span style={{ transition: 'transform .2s', transform: crmOpen ? 'rotate(90deg)' : 'none', display: 'flex' }}>{Icons.chevron}</span>
+      </button>
+      {crmOpen && (
+        <div style={{ paddingLeft: 10, borderLeft: '2px solid var(--brand-100, #dbeafe)', marginLeft: 14 }}>
+          {CRM_ITEMS.map(({ to, label, ic, end }) => (
+            <NavLink key={to} to={to} end={!!end}
+              className={({ isActive }) => "nav-item" + (isActive ? " active" : "")}
+              style={{ fontSize: 12.5, paddingTop: 6, paddingBottom: 6 }}>
+              {Icons[ic]}
+              <span>{label}</span>
+            </NavLink>
+          ))}
+        </div>
+      )}
 
       <div className="nav-label">Modules IA</div>
       {item("/quotes", "quotes-pro", "Devis pro", Icons.sparkle, counts.quotes ?? 7)}
@@ -45,7 +79,6 @@ export function Sidebar({ counts = {} }) {
       <div className="nav-label">Aperçu</div>
       {item("/dashboard", "dashboard", "Tableau de bord", Icons.chart)}
       {item("/exec", "exec", "Vue exécutive", Icons.bolt)}
-      {item("/mobile", "mobile", "Terrain", Icons.map)}
 
       <div className="sidebar-footer">
         <div className="avatar">DM</div>

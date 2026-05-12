@@ -3,51 +3,100 @@ import { useNavigate } from 'react-router-dom';
 import { Sidebar, Topbar, useToast, Modal } from '../components/Shared';
 import { Icons } from '../components/Icons';
 
-const PROSPECTS_INIT = [
-  { id: "P-1", name: "M. Lambert", phone: "06 12 34 56 78", proj: "Rénovation SDB complète", note: "Visite sur place planifiée", value: "4 200 €", color: "#fde7d2", fg: "#7a3a10", initials: "LB", col: "booked", since: "2 j" },
-  { id: "P-2", name: "Boulangerie Lefort", phone: "01 42 87 91 23", proj: "Installation chauffe-eau pro", note: "À recontacter mardi matin", value: "1 850 €", color: "#dbe7ff", fg: "#1444c2", initials: "BL", col: "followup", since: "5 j", hot: true },
-  { id: "P-3", name: "Mme. Garcia", phone: "06 78 11 22 45", proj: "Fuite chauffe-eau", note: "WhatsApp ce matin", value: "320 €", color: "#eafbf2", fg: "#0a7d44", initials: "GA", col: "contact", since: "3 h" },
-  { id: "P-4", name: "Cabinet Roussel", phone: "01 56 78 12 34", proj: "Installation lavabo médical", note: "Devis envoyé · relance prévue", value: "840 €", color: "#f1eefd", fg: "#4a2db5", initials: "CR", col: "sent", since: "4 j" },
-  { id: "P-5", name: "M. Bouchard", phone: "06 22 88 11 45", proj: "WC bouché récurrent", note: "Demande site web", value: "180 €", color: "#ffeef0", fg: "#a91d2e", initials: "BD", col: "contact", since: "1 j", hot: true },
-  { id: "P-6", name: "SCI Bel Air", phone: "01 78 22 11 99", proj: "Réfection 4 SDB locatives", note: "RDV jeudi 14 h", value: "12 400 €", color: "#fde7d2", fg: "#7a3a10", initials: "BA", col: "booked", since: "1 sem" },
-  { id: "P-7", name: "M. Yann Dupré", phone: "06 91 33 11 88", proj: "Audit installation", note: "Email lu, pas de réponse", value: "450 €", color: "#dbe7ff", fg: "#1444c2", initials: "YD", col: "contacted", since: "3 j" },
-  { id: "P-8", name: "Mme. Petit", phone: "06 14 99 33 27", proj: "Robinetterie cuisine", note: "Acceptée · à programmer", value: "240 €", color: "#eafbf2", fg: "#0a7d44", initials: "PE", col: "won", since: "hier" },
-  { id: "P-9", name: "M. Singh", phone: "06 33 22 11 55", proj: "Installation cumulus", note: "A choisi un concurrent", value: "680 €", color: "#fee", fg: "#888", initials: "SI", col: "lost", since: "2 sem" },
-  { id: "P-10", name: "Crèche Les Lutins", phone: "01 33 44 55 66", proj: "Mise aux normes sanitaires", note: "Premier contact LinkedIn", value: "6 800 €", color: "#f1eefd", fg: "#4a2db5", initials: "LL", col: "contact", since: "6 h", hot: true },
+const PALETTE = [
+  ["#fde7d2","#7a3a10"], ["#dbe7ff","#1444c2"],
+  ["#eafbf2","#0a7d44"], ["#f1eefd","#4a2db5"],
 ];
 
-const COLS = [
-  { id: "contact", t: "À contacter", c: "var(--brand-500)" },
-  { id: "contacted", t: "Contactés", c: "var(--ink-4)" },
-  { id: "followup", t: "À relancer", c: "var(--amber-500)" },
-  { id: "booked", t: "RDV pris", c: "var(--violet-500)" },
-  { id: "sent", t: "Devis envoyé", c: "var(--brand-700)" },
-  { id: "won", t: "Gagnés", c: "var(--green-500)" },
-];
+const STATUS_LABELS = {
+  nouveau:     "Nouveau",
+  rdv_booke:   "RDV pris",
+  demo_faite:  "Démo faite",
+  compte_cree: "Compte créé",
+  actif:       "Actif",
+  payant:      "Payant",
+};
+
+function fmtRate(a, b) {
+  return b > 0 ? `${Math.round((a / b) * 100)} %` : "—";
+}
 
 export function CrmPipelineScreen() {
   const nav = useNavigate();
-  const [prospects, setProspects] = useState(PROSPECTS_INIT);
+  const [prospects, setProspects] = useState([]);
+  const [reminders, setReminders] = useState([]);
+  const [campaigns, setCampaigns] = useState([]);
   const [showModal, setShowModal] = useState(false);
-  const [newP, setNewP] = useState({ name: '', phone: '', proj: '', value: '' });
+  const [showCampaignModal, setShowCampaignModal] = useState(false);
+  const [newP, setNewP] = useState({ firstName: '', lastName: '', company: '', phone: '', status: 'nouveau' });
+  const [newC, setNewC] = useState({ name: '', objective: '' });
   const [showToast, Toast] = useToast();
 
-  const addProspect = () => {
-    if (!newP.name.trim()) return;
-    const initials = newP.name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
-    const colors = [["#fde7d2","#7a3a10"],["#dbe7ff","#1444c2"],["#eafbf2","#0a7d44"],["#f1eefd","#4a2db5"]];
-    const [color, fg] = colors[prospects.length % colors.length];
-    setProspects(ps => [...ps, { id: `P-${ps.length + 1}`, ...newP, initials, color, fg, col: 'contact', since: "à l'instant" }]);
-    setShowModal(false);
-    setNewP({ name: '', phone: '', proj: '', value: '' });
-    showToast(`${newP.name} ajouté à la prospection`, 'success');
+  const todayStr = new Date().toISOString().split('T')[0];
+  const nowTime  = new Date().toTimeString().slice(0, 5);
+
+  const overdue = reminders.filter(r => !r.completed && r.date < todayStr);
+  const todayR  = reminders.filter(r => !r.completed && r.date === todayStr);
+  const soonR   = todayR.filter(r => r.time && r.time <= nowTime);
+
+  const funnel = {
+    total:   prospects.length,
+    rdv:     prospects.filter(p => ['rdv_booke','demo_faite','compte_cree','actif','payant'].includes(p.status)).length,
+    comptes: prospects.filter(p => ['compte_cree','actif','payant'].includes(p.status)).length,
+    actifs:  prospects.filter(p => ['actif','payant'].includes(p.status)).length,
+    payants: prospects.filter(p => p.status === 'payant').length,
   };
 
-  const field = (label, key, placeholder) => (
+  const addProspect = () => {
+    const name = `${newP.firstName} ${newP.lastName}`.trim();
+    if (!name) return;
+    const initials = [newP.firstName[0], newP.lastName[0]].filter(Boolean).join('').toUpperCase() || name[0].toUpperCase();
+    const [color, fg] = PALETTE[prospects.length % PALETTE.length];
+    setProspects(ps => [...ps, {
+      id: `P-${Date.now()}`, ...newP, name, initials, color, fg,
+      addedAt: new Date().toISOString(),
+    }]);
+    setNewP({ firstName: '', lastName: '', company: '', phone: '', status: 'nouveau' });
+    setShowModal(false);
+    showToast(`${name} ajouté à la prospection`, 'success');
+  };
+
+  const addCampaign = () => {
+    if (!newC.name.trim()) return;
+    setCampaigns(cs => [...cs, { id: `C-${Date.now()}`, ...newC, status: 'active' }]);
+    setNewC({ name: '', objective: '' });
+    setShowCampaignModal(false);
+    showToast('Campagne créée', 'success');
+  };
+
+  const field = (label, key, placeholder, state, setState, type = 'text') => (
     <div style={{ marginBottom: 14 }}>
       <div className="tiny muted" style={{ marginBottom: 5 }}>{label}</div>
-      <input value={newP[key]} onChange={e => setNewP(p => ({ ...p, [key]: e.target.value }))} placeholder={placeholder}
+      <input type={type} value={state[key]} onChange={e => setState(s => ({ ...s, [key]: e.target.value }))}
+        placeholder={placeholder}
         style={{ width: '100%', padding: '9px 12px', border: '1px solid var(--line)', borderRadius: 8, fontSize: 13, outline: 'none' }} />
+    </div>
+  );
+
+  const ReminderCard = ({ title, items, color, emptyLabel, icon }) => (
+    <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+      <div style={{ padding: '14px 18px 10px', borderBottom: '1px solid var(--line)', display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ color }}>{icon}</span>
+        <span style={{ fontSize: 14, fontWeight: 600 }}>{title} <span className="tnum" style={{ color: 'var(--ink-4)', fontWeight: 400, fontSize: 13 }}>({items.length})</span></span>
+      </div>
+      <div style={{ padding: '10px 18px 14px' }}>
+        {items.length === 0
+          ? <p className="tiny muted">{emptyLabel}</p>
+          : items.slice(0, 5).map(r => (
+              <div key={r.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 0', borderBottom: '1px solid var(--line-soft)', gap: 8 }}>
+                <span style={{ fontSize: 13, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {r.prospectName}
+                </span>
+                <span className="tiny mono muted" style={{ whiteSpace: 'nowrap' }}>{r.date}{r.time ? ` · ${r.time}` : ''}</span>
+              </div>
+            ))
+        }
+      </div>
     </div>
   );
 
@@ -58,85 +107,117 @@ export function CrmPipelineScreen() {
         <Topbar
           title="Prospection"
           right={
-            <>
-              <button className="btn">Cette semaine {Icons.chevronDown}</button>
-              <button className="btn" onClick={() => showToast('Import IA en cours — analyse des leads…', 'info')}>{Icons.bolt} Import IA</button>
-              <button className="btn brand" onClick={() => setShowModal(true)}>{Icons.plus} Nouveau prospect</button>
-            </>
+            <button className="btn brand" onClick={() => setShowModal(true)}>{Icons.plus} Nouveau prospect</button>
           }
         />
-        <div style={{ padding: "20px 24px 8px" }}>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 12, marginBottom: 14 }}>
+
+        <div style={{ flex: 1, overflow: 'auto', padding: '24px' }}>
+
+          {/* KPI */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12, marginBottom: 20 }}>
             {[
-              { l: "Prospects actifs", v: prospects.length, c: "var(--brand-500)" },
-              { l: "Pipeline pondéré", v: "24 380 €", c: "var(--ink)" },
-              { l: "À recontacter aujourd'hui", v: "7", c: "var(--amber-500)" },
-              { l: "Taux de conversion", v: "34 %", c: "var(--green-700)" },
-              { l: "Temps moyen 1er contact", v: "42 min", c: "var(--violet-500)" },
+              { l: "Prospects total",     v: String(prospects.length), c: "var(--brand-500)" },
+              { l: "RDV pris",            v: String(funnel.rdv),       c: "var(--violet-500)" },
+              { l: "Comptes créés",       v: String(funnel.comptes),   c: "var(--green-700)" },
+              { l: "Clients payants",     v: String(funnel.payants),   c: "var(--ink)" },
             ].map((s, i) => (
-              <div key={i} className="card" style={{ padding: "12px 14px" }}>
-                <div className="tiny" style={{ color: "var(--ink-4)", fontWeight: 500 }}>{s.l}</div>
-                <div className="tnum" style={{ fontSize: 20, fontWeight: 600, letterSpacing: "-0.015em", color: s.c, marginTop: 2 }}>{s.v}</div>
+              <div key={i} className="card" style={{ padding: '14px 16px' }}>
+                <div className="tiny" style={{ color: 'var(--ink-4)', fontWeight: 500, marginBottom: 4 }}>{s.l}</div>
+                <div className="tnum" style={{ fontSize: 22, fontWeight: 600, letterSpacing: '-0.015em', color: s.c }}>{s.v}</div>
               </div>
             ))}
           </div>
-        </div>
-        <div style={{ padding: "8px 24px 20px", flex: 1, overflow: "auto" }}>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(6,minmax(220px,1fr))", gap: 12, alignItems: "flex-start", minWidth: 1300 }}>
-            {COLS.map(col => {
-              const cards = prospects.filter(p => p.col === col.id);
-              return (
-                <div key={col.id} style={{ background: "var(--bg-soft)", borderRadius: 12, padding: 10, minHeight: 420 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 6px 10px" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-                      <span style={{ width: 8, height: 8, borderRadius: "50%", background: col.c }} />
-                      <span style={{ fontSize: 12.5, fontWeight: 600, letterSpacing: "-0.005em" }}>{col.t}</span>
-                      <span className="tnum tiny muted" style={{ fontWeight: 500 }}>{cards.length}</span>
-                    </div>
-                    <button className="btn sm ghost" style={{ padding: "2px 6px" }} onClick={() => { setNewP(p => ({ ...p })); setShowModal(true); }}>{Icons.plus}</button>
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                    {cards.map(p => (
-                      <div key={p.id} onClick={() => nav('/crm/' + p.id)} className="card" style={{ padding: "12px 13px", cursor: "pointer", border: p.hot ? "1px solid #ffd1d6" : "1px solid var(--line)" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                          <div style={{ width: 26, height: 26, borderRadius: 7, background: p.color, color: p.fg, display: "grid", placeItems: "center", fontSize: 11, fontWeight: 600, flex: "none" }}>{p.initials}</div>
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.name}</div>
-                            <div className="tiny mono muted" style={{ marginTop: 1 }}>{p.phone}</div>
-                          </div>
-                          {p.hot && <span style={{ fontSize: 11 }}>🔥</span>}
-                        </div>
-                        <div style={{ fontSize: 12.5, color: "var(--ink-2)", marginBottom: 6, lineHeight: 1.4 }}>{p.proj}</div>
-                        <div className="tiny" style={{ color: "var(--ink-4)", marginBottom: 10, lineHeight: 1.4, fontStyle: "italic" }}>« {p.note} »</div>
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingTop: 8, borderTop: "1px solid var(--line-soft)" }}>
-                          <span className="tnum" style={{ fontSize: 13, fontWeight: 600 }}>{p.value}</span>
-                          <span className="tiny muted">{p.since}</span>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+
+          {/* Funnel */}
+          <div className="card" style={{ padding: '16px 20px', marginBottom: 20 }}>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>Funnel d'activation</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 8, textAlign: 'center' }}>
+              {[
+                { l: "Total",   v: funnel.total,   rate: null },
+                { l: "RDV+",    v: funnel.rdv,     rate: fmtRate(funnel.rdv, funnel.total) },
+                { l: "Comptes", v: funnel.comptes, rate: fmtRate(funnel.comptes, funnel.rdv) },
+                { l: "Actifs",  v: funnel.actifs,  rate: fmtRate(funnel.actifs, funnel.comptes) },
+                { l: "Payants", v: funnel.payants, rate: fmtRate(funnel.payants, funnel.actifs) },
+              ].map((f, i) => (
+                <div key={i} style={{ padding: '10px 6px', borderRadius: 10, background: 'var(--bg-soft)' }}>
+                  <div className="tnum" style={{ fontSize: 22, fontWeight: 700 }}>{f.v}</div>
+                  <div className="tiny muted" style={{ marginTop: 2 }}>{f.l}</div>
+                  {f.rate && <div className="tiny" style={{ marginTop: 4, color: 'var(--brand-500)', fontWeight: 600 }}>{f.rate}</div>}
                 </div>
-              );
-            })}
+              ))}
+            </div>
           </div>
+
+          {/* Reminders */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 14, marginBottom: 20 }}>
+            <ReminderCard
+              title="En retard"
+              items={overdue}
+              color="var(--red-500, #e53e3e)"
+              emptyLabel="Aucune relance en retard"
+              icon={Icons.bolt}
+            />
+            <ReminderCard
+              title="Aujourd'hui"
+              items={todayR}
+              color="var(--brand-500)"
+              emptyLabel="Aucune relance prévue aujourd'hui"
+              icon={Icons.calendar}
+            />
+            <ReminderCard
+              title="Dans l'heure"
+              items={soonR}
+              color="var(--amber-500)"
+              emptyLabel="Aucune"
+              icon={Icons.clock}
+            />
+          </div>
+
+          {/* Campaigns */}
+          <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+            <div style={{ padding: '14px 18px', borderBottom: '1px solid var(--line)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span style={{ fontSize: 14, fontWeight: 600 }}>Campagnes actives</span>
+              <button className="btn sm ghost" onClick={() => setShowCampaignModal(true)}>{Icons.plus} Nouvelle</button>
+            </div>
+            <div style={{ padding: '10px 18px 14px' }}>
+              {campaigns.length === 0
+                ? <p className="tiny muted">Aucune campagne active</p>
+                : campaigns.map(c => (
+                    <div key={c.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '9px 0', borderBottom: '1px solid var(--line-soft)' }}>
+                      <span style={{ fontSize: 13, fontWeight: 500 }}>{c.name}</span>
+                      <span className="tiny muted">{c.objective || '—'}</span>
+                    </div>
+                  ))
+              }
+            </div>
+          </div>
+
         </div>
       </div>
 
-      <Modal
-        open={showModal}
-        onClose={() => setShowModal(false)}
-        title="Nouveau prospect"
-        footer={
-          <>
-            <button className="btn" onClick={() => setShowModal(false)}>Annuler</button>
-            <button className="btn brand" onClick={addProspect}>{Icons.plus} Ajouter</button>
-          </>
-        }
-      >
-        {field('Nom', 'name', 'M. Dupont…')}
-        {field('Téléphone', 'phone', '06 12 34 56 78')}
-        {field('Projet', 'proj', 'Rénovation salle de bain…')}
-        {field('Valeur estimée', 'value', '1 200 €')}
+      {/* Prospect modal */}
+      <Modal open={showModal} onClose={() => setShowModal(false)} title="Nouveau prospect"
+        footer={<><button className="btn" onClick={() => setShowModal(false)}>Annuler</button><button className="btn brand" onClick={addProspect}>{Icons.plus} Ajouter</button></>}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 14px' }}>
+          {field('Prénom', 'firstName', 'Jean', newP, setNewP)}
+          {field('Nom', 'lastName', 'Dupont', newP, setNewP)}
+        </div>
+        {field('Société', 'company', 'DPM SA…', newP, setNewP)}
+        {field('Téléphone', 'phone', '06 12 34 56 78', newP, setNewP, 'tel')}
+        <div style={{ marginBottom: 14 }}>
+          <div className="tiny muted" style={{ marginBottom: 5 }}>Statut initial</div>
+          <select value={newP.status} onChange={e => setNewP(p => ({ ...p, status: e.target.value }))}
+            style={{ width: '100%', padding: '9px 12px', border: '1px solid var(--line)', borderRadius: 8, fontSize: 13, outline: 'none' }}>
+            {Object.entries(STATUS_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+          </select>
+        </div>
+      </Modal>
+
+      {/* Campaign modal */}
+      <Modal open={showCampaignModal} onClose={() => setShowCampaignModal(false)} title="Nouvelle campagne"
+        footer={<><button className="btn" onClick={() => setShowCampaignModal(false)}>Annuler</button><button className="btn brand" onClick={addCampaign}>{Icons.plus} Créer</button></>}>
+        {field('Nom de la campagne', 'name', 'Relance printemps 2026…', newC, setNewC)}
+        {field('Objectif', 'objective', 'Générer 10 RDV…', newC, setNewC)}
       </Modal>
 
       {Toast}
@@ -148,12 +229,12 @@ export function CrmDetailScreen() {
   const nav = useNavigate();
   const [showToast, Toast] = useToast();
   const [converted, setConverted] = useState(false);
-  const p = PROSPECTS_INIT[0];
+  const p = { name: "Prospect", initials: "?", color: "var(--bg-soft)", fg: "var(--ink-3)", phone: "", proj: "" };
 
   const handleConvert = () => {
     setConverted(true);
-    showToast(`${p.name} converti en client`, 'success');
-    setTimeout(() => nav('/clients'), 1500);
+    showToast('Converti en client', 'success');
+    setTimeout(() => nav('/crm'), 1500);
   };
 
   return (
@@ -280,14 +361,14 @@ export function CrmContactPopup() {
 
   const handleSend = () => {
     showToast('Email envoyé à M. Lambert', 'success');
-    setTimeout(() => nav('/crm/P-1'), 800);
+    setTimeout(() => nav('/crm'), 800);
   };
 
   return (
     <div className="app">
       <Sidebar />
       <div className="main">
-        <Topbar crumbs={["Prospection", "M. Lambert"]} right={<button className="btn" onClick={() => nav('/crm/P-1')}>{Icons.back} Retour</button>} />
+        <Topbar crumbs={["Prospection", "M. Lambert"]} right={<button className="btn" onClick={() => nav('/crm')}>{Icons.back} Retour</button>} />
         <div style={{ flex: 1, position: "relative", background: "rgba(11,18,32,0.45)", display: "grid", placeItems: "center", padding: 30 }}>
           <div className="card" style={{ width: "100%", maxWidth: 560, padding: 0, overflow: "hidden", boxShadow: "var(--shadow-lg)" }}>
             <div style={{ padding: "18px 22px", borderBottom: "1px solid var(--line)", display: "flex", alignItems: "center", gap: 10 }}>
@@ -323,7 +404,7 @@ export function CrmContactPopup() {
             <div style={{ padding: "14px 22px", borderTop: "1px solid var(--line)", background: "var(--bg-soft)", display: "flex", gap: 8, alignItems: "center" }}>
               <button className="btn ghost" onClick={() => setAttached(true)}>{Icons.attach} Joindre devis</button>
               <div style={{ flex: 1 }} />
-              <button className="btn" onClick={() => nav('/crm/P-1')}>Annuler</button>
+              <button className="btn" onClick={() => nav('/crm')}>Annuler</button>
               <button className="btn brand" onClick={handleSend}>{Icons.send} Envoyer</button>
             </div>
           </div>
