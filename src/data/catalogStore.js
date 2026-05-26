@@ -1,11 +1,17 @@
 import * as XLSX from 'xlsx';
 import { createClient } from '@supabase/supabase-js';
+import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 
 const KEY = 'dpm_catalog';
 const TABLE = 'catalog_products';
+const MAX_LOCAL_CACHE_PRODUCTS = 5000;
+const DB_SELECT_FIELDS = 'id,ref,description,unite,prix_achat,prix_vente,fournisseur,famille,description_cctp,search_text,source,source_sheet';
 let memoryCatalog = null;
-let catalogKeywordIndex = null;
-let indexedCatalogRef = null;
+
+GlobalWorkerOptions.workerSrc = new URL(
+  'pdfjs-dist/legacy/build/pdf.worker.min.mjs',
+  import.meta.url
+).toString();
 
 const EXTRA_FIELDS = ['source', 'sourceSheet', 'prixVente', 'descriptionCctp', 'searchText'];
 
@@ -27,6 +33,10 @@ function formatCatalogError(error, fallbackMessage) {
 // ─── LOCAL CACHE ──────────────────────────────────────────────────────────────
 
 function saveLocal(products) {
+  if (products.length > MAX_LOCAL_CACHE_PRODUCTS) {
+    try { localStorage.removeItem(KEY); } catch { /* trop grand pour le cache local */ }
+    return;
+  }
   try {
     localStorage.setItem(KEY, JSON.stringify(products));
   } catch {
@@ -57,30 +67,56 @@ function mergeCatalogMetadata(products) {
 
 function setCatalogCache(products) {
   memoryCatalog = products;
-  catalogKeywordIndex = null;
-  indexedCatalogRef = products;
   saveLocal(products);
 }
 
 // ─── SUPABASE PERSISTENCE ─────────────────────────────────────────────────────
 
 export async function loadCatalogFromDB() {
-  // Supabase limite à 1000 lignes par défaut — pagination complète
-  let allData = [];
   const PAGE = 1000;
-  let from = 0;
-  while (true) {
-    const { data, error } = await supabase
-      .from(TABLE)
-      .select('*')
-      .order('created_at', { ascending: true })
-      .range(from, from + PAGE - 1);
-    if (error) throw new Error(formatCatalogError(error, 'Chargement du catalogue impossible.'));
-    if (!data || data.length === 0) break;
-    allData = allData.concat(data);
-    if (data.length < PAGE) break;
-    from += PAGE;
+  const { data: firstPage, error: firstError, count } = await supabase
+    .from(TABLE)
+    .select(DB_SELECT_FIELDS, { count: 'exact' })
+    .order('created_at', { ascending: true })
+    .range(0, PAGE - 1);
+
+  if (firstError) {
+    throw new Error(formatCatalogError(firstError, 'Chargement du catalogue impossible.'));
   }
+
+  const total = Number.isFinite(count) ? count : (firstPage?.length || 0);
+  let allData = firstPage || [];
+
+  if (total > PAGE) {
+    const ranges = [];
+    for (let from = PAGE; from < total; from += PAGE) {
+      ranges.push([from, Math.min(from + PAGE - 1, total - 1)]);
+    }
+
+    const CONCURRENCY = 6;
+    for (let i = 0; i < ranges.length; i += CONCURRENCY) {
+      const batch = ranges.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(([from, to]) =>
+          supabase
+            .from(TABLE)
+            .select(DB_SELECT_FIELDS)
+            .order('created_at', { ascending: true })
+            .range(from, to)
+        )
+      );
+
+      results.forEach(({ data, error }) => {
+        if (error) {
+          throw new Error(formatCatalogError(error, 'Chargement du catalogue impossible.'));
+        }
+        if (data?.length) {
+          allData = allData.concat(data);
+        }
+      });
+    }
+  }
+
   const products = allData.map(r => ({
     id: r.id,
     ref: r.ref,
@@ -212,13 +248,19 @@ function cleanBatiprixText(value) {
 
 function cleanBatiprixDescription(value) {
   return cleanBatiprixText(value)
+    .replace(/\bDescription\s*:.*$/i, ' ')
     .replace(/\b\d{2}(?:\s\d{2}){5}\b.*$/g, '')
+    .replace(/\d+[,.]\d{2}\s*€.*$/g, ' ')
+    .replace(/\b\d+\s*\/\s*\d+\b.*$/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
 function cleanBatiprixLabel(value) {
   return cleanBatiprixDescription(value)
+    .replace(/\bDescription\s*:.*$/i, ' ')
+    .replace(/\b\d{2}(?:\s\d{2}){5}\b.*$/g, '')
+    .replace(/\d+[,.]\d{2}\s*€.*$/g, ' ')
     .replace(/\b(?:m²|m3|m²|ml|u|ens|h)\b.*$/i, '')
     .trim();
 }
@@ -372,16 +414,26 @@ export function parseCatalogExcel(file) {
   });
 }
 
+function readPdfArrayBuffer(file) {
+  if (file && typeof file.arrayBuffer === 'function') {
+    return file.arrayBuffer().catch(() => readPdfArrayBufferFallback(file));
+  }
+  return readPdfArrayBufferFallback(file);
+}
+
+function readPdfArrayBufferFallback(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('Impossible de lire le fichier PDF.'));
+    reader.readAsArrayBuffer(file);
+  });
+}
+
 // ─── PDF IMPORT ───────────────────────────────────────────────────────────────
 
 export async function parseCatalogPdf(file) {
-  const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist/legacy/build/pdf.mjs');
-  GlobalWorkerOptions.workerSrc = new URL(
-    'pdfjs-dist/legacy/build/pdf.worker.min.mjs',
-    import.meta.url
-  ).toString();
-
-  const arrayBuffer = await file.arrayBuffer();
+  const arrayBuffer = await readPdfArrayBuffer(file);
   const pdf = await getDocument({ data: arrayBuffer }).promise;
 
   const toNum = v => { const n = parseFloat(String(v ?? '').replace(/\s/g, '').replace(',', '.')); return isNaN(n) ? 0 : n; };
@@ -494,18 +546,93 @@ export async function parseCatalogPdf(file) {
 const normStr = s => (s || '')
   .toLowerCase()
   .normalize('NFD').replace(/[̀-ͯ]/g, '')
+  .replace(/([a-z]+)(\d+)/g, '$1 $2')
+  .replace(/(\d+)([a-z]+)/g, '$1 $2')
+  .replace(/(\d)\s*-\s*(\d)/g, '$1 $2')
+  .replace(/dn\s*(\d+)/g, 'dn $1')
+  .replace(/fi\s*(\d+)/g, 'fi $1')
+  .replace(/ep\s*(\d+)/g, 'ep $1')
+  .replace(/lave[\s-]?mains?/g, ' lavabo ')
+  .replace(/lavabos?/g, ' lavabo ')
+  .replace(/vasques?/g, ' lavabo ')
+  .replace(/robinetterie/g, ' robinet ')
+  .replace(/mitigeurs?/g, ' robinet ')
+  .replace(/robinets?/g, ' robinet ')
+  .replace(/cuvettes?/g, ' wc ')
+  .replace(/toilettes?/g, ' wc ')
+  .replace(/suspendu(?:e|s)?/g, ' suspendu ')
+  .replace(/sur[eé]lev[eé](?:e|es|s)?/g, ' rehausse ')
+  .replace(/handicap[eé]s?/g, ' pmr ')
+  .replace(/accessible?s?/g, ' pmr ')
+  .replace(/laiton chrom[eé]/g, ' chrome ')
+  .replace(/monotrou/g, ' mono ')
+  .replace(/autoportant(?:e|s)?/g, ' sur colonne ')
   .replace(/[^a-z0-9\s]/g, ' ')
   .replace(/\s+/g, ' ').trim();
 
 const STOP = new Set(['de','du','des','le','la','les','en','et','au','aux','un','une','par','sur','sous','dans','pour','avec','sans','ou','a','l','d','est','sont','cette','tout','tous']);
+const IMPORTANT_SHORT_TERMS = new Set(['dn', 'ep', 'ef', 'ec', 'eu', 'ev', 'fi', 'nf', 'bs', 'pm', 'mm', 'cm', 'ml', 'pc', 'u']);
+const TERM_ALIASES = new Map([
+  ['lavabo', ['lavabo', 'vasque', 'lave', 'mains']],
+  ['robinet', ['robinet', 'robinetterie', 'mitigeur', 'melangeur', 'mixer']],
+  ['wc', ['wc', 'toilette', 'cuvette']],
+  ['pmr', ['pmr', 'handicape', 'accessible']],
+  ['vidage', ['vidage', 'bonde', 'siphon']],
+  ['fixation', ['fixation', 'support', 'bati', 'console']],
+  ['evacuation', ['evacuation', 'tubulure', 'tube', 'pvc']],
+]);
 
 function keywords(s) {
-  return normStr(s).split(' ').filter(w => w.length > 2 && !STOP.has(w));
+  const base = normStr(s).split(' ').filter((w) => {
+    if (STOP.has(w)) return false;
+    if (IMPORTANT_SHORT_TERMS.has(w)) return true;
+    return w.length > 2 || /^\d+$/.test(w);
+  });
+  const expanded = new Set(base);
+
+  base.forEach((word) => {
+    TERM_ALIASES.forEach((aliases, canonical) => {
+      if (aliases.includes(word) || canonical === word) {
+        expanded.add(canonical);
+        aliases.forEach((alias) => expanded.add(alias));
+      }
+    });
+  });
+
+  return [...expanded].filter((w) => !STOP.has(w) && (IMPORTANT_SHORT_TERMS.has(w) || w.length > 2 || /^\d+$/.test(w)));
+}
+
+function tokenWeight(token) {
+  if (!token) return 0;
+  if (/^\d+$/.test(token)) return 3.5;
+  if (IMPORTANT_SHORT_TERMS.has(token)) return 2.8;
+  if (token.length >= 10) return 3;
+  if (token.length >= 7) return 2.4;
+  if (token.length >= 5) return 1.8;
+  return 1.2;
+}
+
+function weightedTokenMap(text) {
+  const map = new Map();
+  keywords(text).forEach((token) => {
+    map.set(token, Math.max(map.get(token) || 0, tokenWeight(token)));
+  });
+  return map;
+}
+
+function normalizedIncludesToken(text, token) {
+  return normStr(text).split(' ').includes(token);
+}
+
+function countSharedWeighted(queryMap, productMap) {
+  let shared = 0;
+  queryMap.forEach((weight, token) => {
+    if (productMap.has(token)) shared += weight;
+  });
+  return shared;
 }
 
 function getCatalogKeywordIndex(catalog) {
-  if (catalogKeywordIndex && indexedCatalogRef === catalog) return catalogKeywordIndex;
-
   const buckets = new Map();
   catalog.forEach((product, idx) => {
     const terms = [...new Set(keywords(product.searchText || product.description))];
@@ -514,54 +641,181 @@ function getCatalogKeywordIndex(catalog) {
       buckets.get(term).push(idx);
     });
   });
-
-  catalogKeywordIndex = buckets;
-  indexedCatalogRef = catalog;
   return buckets;
 }
 
 // Score similarity between two descriptions (0–1)
 function similarity(a, b) {
-  const ka = new Set(keywords(a));
-  const kb = new Set(keywords(b));
-  if (!ka.size || !kb.size) return 0;
-  const inter = [...ka].filter(k => kb.has(k)).length;
-  return inter / Math.max(ka.size, kb.size);
+  const normalizedA = normStr(a);
+  const normalizedB = normStr(b);
+  const qa = weightedTokenMap(a);
+  const qb = weightedTokenMap(b);
+  if (!qa.size || !qb.size) return 0;
+
+  const sharedQueryWeight = countSharedWeighted(qa, qb);
+  const queryTotal = [...qa.values()].reduce((sum, value) => sum + value, 0);
+  const productTotal = [...qb.values()].reduce((sum, value) => sum + value, 0);
+
+  let score = (sharedQueryWeight / queryTotal) * 0.78 + (sharedQueryWeight / productTotal) * 0.22;
+
+  const phraseA = normalizedA.split(' ').filter(Boolean);
+  const phraseB = normalizedB.split(' ').filter(Boolean);
+  const exactSequence = phraseA.filter((token, index) => token === phraseB[index]).length;
+  if (phraseA.length > 1) score += Math.min(0.12, exactSequence / phraseA.length * 0.12);
+
+  qa.forEach((weight, token) => {
+    if (normalizedIncludesToken(normalizedB, token)) score += Math.min(0.05, weight * 0.01);
+  });
+
+  TERM_ALIASES.forEach((aliases, canonical) => {
+    const aHas = aliases.some((term) => normalizedA.includes(term)) || normalizedA.includes(canonical);
+    const bHas = aliases.some((term) => normalizedB.includes(term)) || normalizedB.includes(canonical);
+    if (aHas && bHas) score += 0.08;
+  });
+
+  if (normalizedA.includes('lavabo') && normalizedB.includes('lavabo')) score += 0.08;
+  if (normalizedA.includes('robinet') && normalizedB.includes('robinet')) score += 0.08;
+  if (normalizedA.includes('wc') && normalizedB.includes('wc')) score += 0.08;
+  if (normalizedA.includes('pmr') && normalizedB.includes('pmr')) score += 0.05;
+
+  return Math.min(1, score);
 }
 
-// For each DPGF line find the best matching catalog product
-// Returns array of { lineId, product, score }
+function pickBestMatch(lineDescription, catalog, keywordIndex) {
+  if (!catalog.length) return { best: null, bestScore: 0 };
+
+  const lineKeywords = [...new Set(keywords(lineDescription))];
+  const candidateIds = new Set();
+
+  lineKeywords.forEach((term) => {
+    const matches = keywordIndex.get(term);
+    if (!matches) return;
+    for (const idx of matches) {
+      candidateIds.add(idx);
+      if (candidateIds.size >= 250) break;
+    }
+  });
+
+  const candidates = candidateIds.size
+    ? [...candidateIds].map((idx) => catalog[idx])
+    : catalog.slice(0, 250);
+
+  let best = null;
+  let bestScore = 0;
+  for (const product of candidates) {
+    const score = similarity(lineDescription, product.searchText || product.description);
+    if (score > bestScore) {
+      bestScore = score;
+      best = product;
+    }
+  }
+
+  return { best, bestScore };
+}
+
+export function searchCatalogOptions(query, catalog, limit = 20, context = '', keywordIndex = null) {
+  const needle = String(query || '').trim();
+  const contextNeedle = String(context || '').trim();
+  const effectiveNeedle = [needle, contextNeedle].filter(Boolean).join(' — ').trim();
+  if (!effectiveNeedle || !catalog.length) return [];
+
+  const effectiveKeywordIndex = keywordIndex || getCatalogKeywordIndex(catalog);
+  const needleKeywords = [...new Set(keywords(effectiveNeedle))];
+  const candidateIds = new Set();
+
+  needleKeywords.forEach((term) => {
+    const matches = effectiveKeywordIndex.get(term);
+    if (!matches) return;
+    for (const idx of matches) {
+      candidateIds.add(idx);
+      if (candidateIds.size >= 400) break;
+    }
+  });
+
+  const candidates = candidateIds.size
+    ? [...candidateIds].map((idx) => catalog[idx])
+    : catalog.slice(0, 400);
+
+  const minScore = needleKeywords.length <= 2 ? 0.08 : 0.12;
+
+  return candidates
+    .map((product) => ({
+      product,
+      score: similarity(effectiveNeedle, product.searchText || product.description),
+      source: product.source === 'batiprix' ? 'batiprix' : 'catalog',
+    }))
+    .filter((entry) => entry.score >= minScore)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return (a.product.description || '').localeCompare(b.product.description || '', 'fr');
+    })
+    .slice(0, limit);
+}
+
+// For each DPGF line find the best supplier match and the best Batiprix fallback.
 export function matchCatalogToLines(dpgfLines, catalog) {
   if (!catalog.length) return [];
-  const keywordIndex = getCatalogKeywordIndex(catalog);
+  const fullKeywordIndex = getCatalogKeywordIndex(catalog);
+  const supplierCatalog = catalog.filter((product) => product.source !== 'batiprix');
+  const batiprixCatalog = catalog.filter((product) => product.source === 'batiprix');
+  const supplierKeywordIndex = getCatalogKeywordIndex(supplierCatalog);
+  const batiprixKeywordIndex = getCatalogKeywordIndex(batiprixCatalog);
 
   return dpgfLines
     .filter(l => !l.isSection)
     .map(l => {
-      const lineKeywords = [...new Set(keywords(l.description))];
-      const candidateIds = new Set();
+      const lineText = l.matchText || l.description;
+      const { best: supplierBest, bestScore: supplierScore } = pickBestMatch(lineText, supplierCatalog, supplierKeywordIndex);
+      const { best: batiprixBest, bestScore: batiprixScore } = pickBestMatch(lineText, batiprixCatalog, batiprixKeywordIndex);
+      const manualSuggestion = searchCatalogOptions(l.description || lineText, catalog, 6, lineText, fullKeywordIndex)
+        .find((entry) => entry.product.id !== supplierBest?.id && entry.product.id !== batiprixBest?.id) || null;
 
-      lineKeywords.forEach((term) => {
-        const matches = keywordIndex.get(term);
-        if (!matches) return;
-        for (const idx of matches) {
-          candidateIds.add(idx);
-          if (candidateIds.size >= 250) break;
-        }
-      });
+      const supplierMatch = supplierBest && supplierScore >= 0.35
+        ? {
+            product: supplierBest,
+            score: supplierScore,
+            matchType: 'catalog',
+          }
+        : null;
 
-      const candidates = candidateIds.size
-        ? [...candidateIds].map(idx => catalog[idx])
-        : catalog.slice(0, 250);
+      const batiprixMatch = batiprixBest && batiprixScore >= 0.2
+        ? {
+            product: batiprixBest,
+            score: batiprixScore,
+            matchType: 'batiprix-fallback',
+            supplierScore,
+          }
+        : null;
 
-      let best = null, bestScore = 0;
-      for (const p of candidates) {
-        const s = similarity(l.description, p.searchText || p.description);
-        if (s > bestScore) { bestScore = s; best = p; }
-      }
-      if (bestScore < 0.2) return null; // below threshold
-      return { lineId: l.id, line: l, product: best, score: bestScore };
+      const manualMatch = manualSuggestion && manualSuggestion.score >= 0.2
+        ? {
+            product: manualSuggestion.product,
+            score: manualSuggestion.score,
+            source: manualSuggestion.source,
+            matchType: 'manual-suggestion',
+          }
+        : null;
+
+      const rankedChoices = [
+        supplierMatch ? { key: 'catalog', score: supplierMatch.score } : null,
+        batiprixMatch ? { key: 'batiprix', score: batiprixMatch.score } : null,
+        manualMatch ? { key: 'manual', score: manualMatch.score } : null,
+      ].filter(Boolean).sort((a, b) => b.score - a.score);
+
+      const defaultChoice = rankedChoices[0]?.key || null;
+
+      if (!supplierMatch && !batiprixMatch && !manualMatch) return null;
+
+      return {
+        lineId: l.id,
+        line: l,
+        supplierMatch,
+        batiprixMatch,
+        manualMatch,
+        defaultChoice,
+        bestScore: Math.max(supplierMatch?.score || 0, batiprixMatch?.score || 0, manualMatch?.score || 0),
+      };
     })
     .filter(Boolean)
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => b.bestScore - a.bestScore);
 }

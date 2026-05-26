@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useDeferredValue, useEffect, useRef, useState, startTransition } from 'react';
 import { Sidebar, Topbar, useToast } from '../components/Shared';
 import { Icons } from '../components/Icons';
 import * as XLSX from 'xlsx';
@@ -26,9 +26,11 @@ const DEMO_PRODUCTS = [
 ];
 
 export default function CatalogScreen() {
+  const INITIAL_VISIBLE_ROWS = 200;
   const [products, setProducts] = useState([]);
   const [search, setSearch] = useState('');
   const [familyFilter, setFamilyFilter] = useState('');
+  const [visibleRows, setVisibleRows] = useState(INITIAL_VISIBLE_ROWS);
   const [editId, setEditId] = useState(null);
   const [editData, setEditData] = useState({});
   const [importing, setImporting] = useState(false);
@@ -41,17 +43,18 @@ export default function CatalogScreen() {
   const [loadError, setLoadError] = useState('');
   const [showToast, Toast] = useToast();
   const fileRef = useRef();
+  const deferredSearch = useDeferredValue(search);
 
   // Charge depuis Supabase au montage, met à jour le cache local
   useEffect(() => {
     const cachedProducts = loadCatalog();
     if (cachedProducts.length) {
-      setProducts(cachedProducts);
+      startTransition(() => setProducts(cachedProducts));
     }
 
     loadCatalogFromDB()
       .then((loadedProducts) => {
-        setProducts(loadedProducts);
+        startTransition(() => setProducts(loadedProducts));
         setLoadError('');
       })
       .catch((err) => {
@@ -96,7 +99,7 @@ export default function CatalogScreen() {
     const supplier = supplierName.trim();
     const withSupplier = parsed.map(p => ({ ...p, fournisseur: supplier || p.fournisseur }));
     const next = [...products, ...withSupplier];
-    setProducts(next);
+    startTransition(() => setProducts(next));
     saveCatalog(next);
 
     setSaving(true);
@@ -111,7 +114,7 @@ export default function CatalogScreen() {
   };
 
   const loadDemo = async () => {
-    setProducts(DEMO_PRODUCTS);
+    startTransition(() => setProducts(DEMO_PRODUCTS));
     saveCatalog(DEMO_PRODUCTS);
     setSaving(true);
     try {
@@ -129,7 +132,7 @@ export default function CatalogScreen() {
   const commitEdit = async () => {
     const updated = { ...products.find(p => p.id === editId), ...editData };
     const next = products.map(p => p.id === editId ? updated : p);
-    setProducts(next);
+    startTransition(() => setProducts(next));
     saveCatalog(next);
     setSaving(true);
     try {
@@ -145,7 +148,7 @@ export default function CatalogScreen() {
 
   const deleteProduct = async (id) => {
     const next = products.filter(p => p.id !== id);
-    setProducts(next);
+    startTransition(() => setProducts(next));
     saveCatalog(next);
     setSaving(true);
     try {
@@ -169,7 +172,7 @@ export default function CatalogScreen() {
       next = products.filter(p => p.famille !== bulkTarget);
       deletedIds = products.filter(p => p.famille === bulkTarget).map(p => p.id);
     }
-    setProducts(next);
+    startTransition(() => setProducts(next));
     saveCatalog(next);
     setSaving(true);
     try {
@@ -190,7 +193,7 @@ export default function CatalogScreen() {
   const addRow = () => {
     const newP = { id: `new-${Date.now()}`, ref: '', description: '', unite: 'u', prixAchat: 0, fournisseur: '', famille: '' };
     const next = [newP, ...products];
-    setProducts(next);
+    startTransition(() => setProducts(next));
     saveCatalog(next);
     startEdit(newP);
   };
@@ -207,13 +210,18 @@ export default function CatalogScreen() {
     showToast('Export Excel généré', 'success');
   };
 
+  useEffect(() => {
+    setVisibleRows(INITIAL_VISIBLE_ROWS);
+  }, [deferredSearch, familyFilter]);
+
   const families = [...new Set(products.map(p => p.famille).filter(Boolean))];
   const displayed = products.filter(p => {
-    const q = search.toLowerCase();
+    const q = deferredSearch.toLowerCase();
     const matchSearch = !q || p.description.toLowerCase().includes(q) || p.ref.toLowerCase().includes(q) || p.fournisseur?.toLowerCase().includes(q);
     const matchFamily = !familyFilter || p.famille === familyFilter;
     return matchSearch && matchFamily;
   });
+  const visibleProducts = displayed.slice(0, visibleRows);
 
   const totalValue = products.reduce((s, p) => s + p.prixAchat, 0);
 
@@ -318,7 +326,7 @@ export default function CatalogScreen() {
                 </tr>
               </thead>
               <tbody>
-                {displayed.map(p => {
+                {visibleProducts.map(p => {
                   if (editId === p.id) {
                     const inp = (field, width, type = 'text', placeholder = '') => (
                       <input
@@ -376,6 +384,17 @@ export default function CatalogScreen() {
             {displayed.length === 0 && products.length > 0 && (
               <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--ink-4)', fontSize: 13 }}>
                 Aucun produit ne correspond à la recherche
+              </div>
+            )}
+
+            {displayed.length > visibleRows && (
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 24px', borderTop: '1px solid var(--line)' }}>
+                <span className="tiny muted">
+                  Affichage de {visibleProducts.length.toLocaleString('fr-FR')} produits sur {displayed.length.toLocaleString('fr-FR')}
+                </span>
+                <button className="btn" onClick={() => setVisibleRows((count) => count + INITIAL_VISIBLE_ROWS)}>
+                  Afficher {Math.min(INITIAL_VISIBLE_ROWS, displayed.length - visibleRows)} de plus
+                </button>
               </div>
             )}
           </div>

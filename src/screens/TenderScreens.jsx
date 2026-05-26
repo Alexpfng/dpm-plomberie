@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { Sidebar, Topbar, useToast } from '../components/Shared';
 import { Icons } from '../components/Icons';
 import { parseDPGF, exportDPGF, saveTender, loadTender, loadTenderHistory, loadTenderById, setCurrentTender, deleteTenderFromHistory, parseCCTPText, parseCCTPSections, findQtyInCCTP } from '../data/tenderStore';
-import { loadCatalog, loadCatalogFromDB, matchCatalogToLines } from '../data/catalogStore';
+import { loadCatalog, loadCatalogFromDB, matchCatalogToLines, searchCatalogOptions } from '../data/catalogStore';
 
 const fmt = (n) =>
   (typeof n === 'number' ? n : parseFloat(n) || 0)
@@ -336,8 +336,10 @@ export function TenderMatchScreen() {
   const [catalogMatches, setCatalogMatches] = useState([]);
   const [globalCoeff, setGlobalCoeff] = useState('1.40');
   const [coeffOverrides, setCoeffOverrides] = useState({});
-  const [checkedMatches, setCheckedMatches] = useState({});
+  const [selectedMatchChoice, setSelectedMatchChoice] = useState({});
+  const [manualMatchSelections, setManualMatchSelections] = useState({});
   const [catalogLoading, setCatalogLoading] = useState(false);
+  const [manualCatalogPicker, setManualCatalogPicker] = useState(null);
 
   // ── CCTP spec popover ─────────────────────────────────────────────────────
   const [specPopover, setSpecPopover] = useState(null);
@@ -366,6 +368,67 @@ export function TenderMatchScreen() {
     ensureCatalogReady().catch(() => {});
   }, [ensureCatalogReady]);
 
+  const openManualCatalogPicker = async (line, mode = 'apply-now') => {
+    const catalog = await ensureCatalogReady();
+    if (!catalog.length) {
+      showToast('Base produits vide — importez votre catalogue d\'abord', 'info');
+      return;
+    }
+    const query = getLineDescription(line);
+    const contextQuery = line.matchText && line.matchText !== query ? line.matchText : '';
+    setManualCatalogPicker({
+      mode,
+      lineId: line.id,
+      query,
+      contextQuery,
+      results: searchCatalogOptions(query, catalog, 24, contextQuery),
+    });
+  };
+
+  const updateManualCatalogQuery = (query) => {
+    const catalog = loadCatalog();
+    setManualCatalogPicker((current) => current ? ({
+      ...current,
+      query,
+      results: searchCatalogOptions(query, catalog, 24, current.contextQuery),
+    }) : current);
+  };
+
+  const applyManualCatalogChoice = (entry) => {
+    if (!manualCatalogPicker) return;
+    if (manualCatalogPicker.mode === 'modal-select') {
+      setManualMatchSelections((current) => ({
+        ...current,
+        [manualCatalogPicker.lineId]: entry,
+      }));
+      setSelectedMatchChoice((current) => ({
+        ...current,
+        [manualCatalogPicker.lineId]: 'manual',
+      }));
+      showToast(`Recherche manuelle prête depuis ${entry.source === 'batiprix' ? 'Batiprix' : 'la base produits'}`, 'success');
+      setManualCatalogPicker(null);
+      return;
+    }
+
+    const c = parseFloat(globalCoeff.replace(',', '.')) || 1.4;
+    const pu = parseFloat((entry.product.prixAchat * c).toFixed(2));
+    let nextLines;
+    setLines((ls) => {
+      nextLines = ls.map((line) => line.id !== manualCatalogPicker.lineId ? line : {
+        ...line,
+        prixUnitaire: pu,
+        totalHT: line.quantite * pu,
+        puFromCatalog: true,
+        catalogRef: entry.product.ref,
+        catalogSource: entry.source === 'batiprix' ? 'batiprix' : 'catalog',
+      });
+      return nextLines;
+    });
+    setTimeout(() => { if (nextLines) handleSave(nextLines); }, 0);
+    showToast(`Prix manuel appliqué depuis ${entry.source === 'batiprix' ? 'Batiprix' : 'la base produits'}`, 'success');
+    setManualCatalogPicker(null);
+  };
+
   const openCatalogModal = async () => {
     const catalog = await ensureCatalogReady();
     if (!catalog.length) {
@@ -378,9 +441,14 @@ export function TenderMatchScreen() {
       return;
     }
     setCatalogMatches(matches);
-    const checked = {};
-    matches.forEach(m => { checked[m.lineId] = m.score >= 0.4; });
-    setCheckedMatches(checked);
+    const defaults = {};
+    const manualDefaults = {};
+    matches.forEach((m) => {
+      defaults[m.lineId] = m.defaultChoice;
+      if (m.manualMatch) manualDefaults[m.lineId] = m.manualMatch;
+    });
+    setSelectedMatchChoice(defaults);
+    setManualMatchSelections(manualDefaults);
     setCoeffOverrides({});
     setShowCatalogModal(true);
   };
@@ -391,13 +459,27 @@ export function TenderMatchScreen() {
     let nextLines;
     setLines(ls => {
       nextLines = ls.map(l => {
-        if (!checkedMatches[l.id]) return l;
         const match = catalogMatches.find(m => m.lineId === l.id);
         if (!match) return l;
+        const choice = selectedMatchChoice[l.id];
+        if (!choice) return l;
+        const selectedMatch = choice === 'manual'
+          ? manualMatchSelections[l.id]
+          : choice === 'batiprix'
+            ? match.batiprixMatch
+            : match.supplierMatch;
+        if (!selectedMatch) return l;
         const c = parseFloat((coeffOverrides[l.id] ?? '').replace(',', '.')) || gc;
-        const pu = parseFloat((match.product.prixAchat * c).toFixed(2));
+        const pu = parseFloat((selectedMatch.product.prixAchat * c).toFixed(2));
         applied++;
-        return { ...l, prixUnitaire: pu, totalHT: l.quantite * pu, puFromCatalog: true, catalogRef: match.product.ref };
+        return {
+          ...l,
+          prixUnitaire: pu,
+          totalHT: l.quantite * pu,
+          puFromCatalog: true,
+          catalogRef: selectedMatch.product.ref,
+          catalogSource: choice === 'batiprix' ? 'batiprix' : (selectedMatch.source === 'batiprix' ? 'batiprix' : 'catalog'),
+        };
       });
       return nextLines;
     });
@@ -529,9 +611,11 @@ export function TenderMatchScreen() {
         onMouseLeave={e => { if (!line.puFromCatalog) { e.currentTarget.style.borderColor = 'transparent'; e.currentTarget.style.background = 'transparent'; } }}
       >
         {line.puFromCatalog && (
-          <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--green-700)', background: '#dcfce7', padding: '1px 4px', borderRadius: 4, textTransform: 'uppercase' }}>cat.</span>
+          <span style={{ fontSize: 9, fontWeight: 700, color: line.catalogSource === 'batiprix' ? 'var(--violet-700)' : 'var(--green-700)', background: line.catalogSource === 'batiprix' ? '#ede9fe' : '#dcfce7', padding: '1px 4px', borderRadius: 4, textTransform: 'uppercase' }}>
+            {line.catalogSource === 'batiprix' ? 'bati' : 'cat.'}
+          </span>
         )}
-        <span style={{ fontWeight: 600, fontFamily: 'var(--font-mono)', color: line.puFromCatalog ? 'var(--green-700)' : 'inherit' }}>{fmt(line.prixUnitaire)}</span>
+        <span style={{ fontWeight: 600, fontFamily: 'var(--font-mono)', color: line.puFromCatalog ? (line.catalogSource === 'batiprix' ? 'var(--violet-700)' : 'var(--green-700)') : 'inherit' }}>{fmt(line.prixUnitaire)}</span>
       </div>
     );
   };
@@ -717,7 +801,13 @@ export function TenderMatchScreen() {
                     onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
                     <td style={{ padding: '8px 14px', fontFamily: 'var(--font-mono)', fontSize: 11.5, color: 'var(--ink-4)', whiteSpace: 'nowrap' }}>{line.num}</td>
                     <td style={{ padding: '8px 14px', color: 'var(--ink-2)', lineHeight: 1.4 }}>
-                      <div style={{ fontWeight: 500 }}>{getLineDescription(line)}</div>
+                      <div
+                        style={{ fontWeight: 500, cursor: 'pointer' }}
+                        title="Cliquer pour rechercher manuellement une base produit ou une référence Batiprix"
+                        onClick={() => openManualCatalogPicker(line)}
+                      >
+                        {getLineDescription(line)}
+                      </div>
                       {line.cctpSpecs?.length > 0 ? (
                         <div
                           onClick={(e) => openSpecPopover(e, line)}
@@ -856,10 +946,10 @@ export function TenderMatchScreen() {
       {/* ── Catalog matching modal ── */}
       {showCatalogModal && (() => {
         const gc = parseFloat(globalCoeff.replace(',', '.')) || 1.4;
-        const selected = catalogMatches.filter(m => checkedMatches[m.lineId]);
+        const selected = catalogMatches.filter(m => !!selectedMatchChoice[m.lineId]);
         return (
           <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 500, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
-            <div className="card" style={{ width: '100%', maxWidth: 820, maxHeight: '86vh', display: 'flex', flexDirection: 'column', padding: 0, boxShadow: 'var(--shadow-lg)' }}>
+            <div className="card" style={{ width: '100%', maxWidth: 1080, maxHeight: '86vh', display: 'flex', flexDirection: 'column', padding: 0, boxShadow: 'var(--shadow-lg)' }}>
               {/* Header */}
               <div style={{ padding: '20px 24px 16px', borderBottom: '1px solid var(--line)', display: 'flex', alignItems: 'center', gap: 12 }}>
                 <span style={{ width: 36, height: 36, borderRadius: 10, background: '#dcfce7', color: 'var(--green-700)', display: 'grid', placeItems: 'center' }}>{Icons.package}</span>
@@ -886,41 +976,135 @@ export function TenderMatchScreen() {
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                   <thead>
                     <tr style={{ background: 'var(--bg-soft)', position: 'sticky', top: 0, zIndex: 5 }}>
-                      <th style={{ padding: '9px 12px', textAlign: 'center', width: 40, fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>
-                        <input type="checkbox"
-                          checked={catalogMatches.every(m => checkedMatches[m.lineId])}
-                          onChange={e => { const v = {}; catalogMatches.forEach(m => { v[m.lineId] = e.target.checked; }); setCheckedMatches(v); }}
-                        />
-                      </th>
                       <th style={{ padding: '9px 12px', textAlign: 'left', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Désignation DPGF</th>
-                      <th style={{ padding: '9px 12px', textAlign: 'left', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Produit catalogue</th>
+                      <th style={{ padding: '9px 12px', textAlign: 'left', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Base produits</th>
+                      <th style={{ padding: '9px 12px', textAlign: 'left', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Batiprix secours</th>
+                      <th style={{ padding: '9px 12px', textAlign: 'left', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Choix manuel</th>
                       <th style={{ padding: '9px 12px', textAlign: 'right', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>PA HT</th>
                       <th style={{ padding: '9px 12px', textAlign: 'center', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Coeff.</th>
                       <th style={{ padding: '9px 12px', textAlign: 'right', fontSize: 11, color: 'var(--green-700)', fontWeight: 600 }}>PU proposé</th>
-                      <th style={{ padding: '9px 12px', textAlign: 'center', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Match</th>
+                      <th style={{ padding: '9px 12px', textAlign: 'center', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Choix</th>
                     </tr>
                   </thead>
                   <tbody>
                     {catalogMatches.map(m => {
                       const c = parseFloat((coeffOverrides[m.lineId] ?? '').replace(',', '.')) || gc;
-                      const puPropose = parseFloat((m.product.prixAchat * c).toFixed(2));
-                      const checked = !!checkedMatches[m.lineId];
-                      const scoreColor = m.score >= 0.6 ? 'var(--green-700)' : m.score >= 0.35 ? 'var(--brand-700)' : 'var(--ink-4)';
+                      const choice = selectedMatchChoice[m.lineId];
+                      const manual = manualMatchSelections[m.lineId] || m.manualMatch;
+                      const selectedMatch = choice === 'manual'
+                        ? manual
+                        : choice === 'batiprix'
+                          ? m.batiprixMatch
+                          : m.supplierMatch;
+                      const puPropose = selectedMatch ? parseFloat((selectedMatch.product.prixAchat * c).toFixed(2)) : 0;
+                      const supplier = m.supplierMatch;
+                      const batiprix = m.batiprixMatch;
+                      const supplierScoreColor = (supplier?.score || 0) >= 0.6 ? 'var(--green-700)' : (supplier?.score || 0) >= 0.35 ? 'var(--brand-700)' : 'var(--ink-4)';
                       return (
-                        <tr key={m.lineId} style={{ opacity: checked ? 1 : 0.45, borderBottom: '1px solid var(--line-soft)', background: checked ? '' : 'var(--bg-soft)' }}>
-                          <td style={{ padding: '10px 12px', textAlign: 'center' }}>
-                            <input type="checkbox" checked={checked}
-                              onChange={e => setCheckedMatches(p => ({ ...p, [m.lineId]: e.target.checked }))} />
-                          </td>
+                        <tr key={m.lineId} style={{ opacity: choice ? 1 : 0.6, borderBottom: '1px solid var(--line-soft)', background: choice ? '' : 'var(--bg-soft)' }}>
                           <td style={{ padding: '10px 12px' }}>
                             <div style={{ fontWeight: 500, fontSize: 13 }}>{getLineDescription(m.line).substring(0, 55)}{getLineDescription(m.line).length > 55 ? '…' : ''}</div>
                             <div className="tiny muted">{m.line.num} · {m.line.unite}</div>
                           </td>
                           <td style={{ padding: '10px 12px' }}>
-                            <div style={{ fontSize: 13 }}>{m.product.description.substring(0, 50)}{m.product.description.length > 50 ? '…' : ''}</div>
-                            <div className="tiny" style={{ color: 'var(--ink-4)' }}>{m.product.ref && <span style={{ fontFamily: 'var(--font-mono)' }}>{m.product.ref} · </span>}{m.product.fournisseur}</div>
+                            {supplier ? (
+                              <>
+                                <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+                                  <input
+                                    type="radio"
+                                    name={`match-${m.lineId}`}
+                                    checked={choice === 'catalog'}
+                                    onChange={() => setSelectedMatchChoice((p) => ({ ...p, [m.lineId]: 'catalog' }))}
+                                  />
+                                  <div>
+                                    <div className="tiny muted" style={{ marginBottom: 3 }}>Produit catalogue</div>
+                                    <div style={{ fontSize: 13 }}>{supplier.product.description.substring(0, 46)}{supplier.product.description.length > 46 ? '…' : ''}</div>
+                                    <div className="tiny" style={{ color: 'var(--ink-4)' }}>
+                                      {supplier.product.ref && <span style={{ fontFamily: 'var(--font-mono)' }}>{supplier.product.ref} · </span>}
+                                      {supplier.product.fournisseur}
+                                    </div>
+                                    <span style={{ marginTop: 4, display: 'inline-block', fontSize: 11, fontWeight: 700, color: supplierScoreColor, background: supplierScoreColor + '18', padding: '2px 7px', borderRadius: 20 }}>
+                                      {Math.round(supplier.score * 100)}%
+                                    </span>
+                                  </div>
+                                </label>
+                              </>
+                            ) : (
+                              <div className="tiny muted">Aucune base produit fiable</div>
+                            )}
                           </td>
-                          <td style={{ padding: '10px 12px', textAlign: 'right', fontFamily: 'var(--font-mono)', color: 'var(--ink-3)' }}>{fmt(m.product.prixAchat)}</td>
+                          <td style={{ padding: '10px 12px' }}>
+                            {batiprix ? (
+                              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+                                <input
+                                  type="radio"
+                                  name={`match-${m.lineId}`}
+                                  checked={choice === 'batiprix'}
+                                  onChange={() => setSelectedMatchChoice((p) => ({ ...p, [m.lineId]: 'batiprix' }))}
+                                />
+                                <div>
+                                  <div className="tiny muted" style={{ marginBottom: 3 }}>
+                                    Réf. Batiprix de secours
+                                    {Number.isFinite(batiprix.supplierScore) && (
+                                      <span style={{ marginLeft: 8 }}>
+                                        base produit {supplier ? Math.round((batiprix.supplierScore || 0) * 100) : 0}%
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div style={{ fontSize: 13 }}>{batiprix.product.description.substring(0, 46)}{batiprix.product.description.length > 46 ? '…' : ''}</div>
+                                  <div className="tiny" style={{ color: 'var(--ink-4)' }}>
+                                    {batiprix.product.ref && <span style={{ fontFamily: 'var(--font-mono)' }}>{batiprix.product.ref} · </span>}
+                                    {batiprix.product.fournisseur}
+                                  </div>
+                                  <span style={{ marginTop: 4, display: 'inline-block', fontSize: 11, fontWeight: 700, color: 'var(--violet-700)', background: '#ede9fe', padding: '2px 7px', borderRadius: 20 }}>
+                                    Batiprix {Math.round(batiprix.score * 100)}%
+                                  </span>
+                                </div>
+                              </label>
+                            ) : (
+                              <div className="tiny muted">Pas de secours Batiprix</div>
+                            )}
+                          </td>
+                          <td style={{ padding: '10px 12px' }}>
+                            {manual ? (
+                              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+                                <input
+                                  type="radio"
+                                  name={`match-${m.lineId}`}
+                                  checked={choice === 'manual'}
+                                  onChange={() => setSelectedMatchChoice((p) => ({ ...p, [m.lineId]: 'manual' }))}
+                                />
+                                <div>
+                                  <div className="tiny muted" style={{ marginBottom: 3 }}>Suggestion manuelle</div>
+                                  <div style={{ fontSize: 13 }}>{manual.product.description.substring(0, 46)}{manual.product.description.length > 46 ? '…' : ''}</div>
+                                  <div className="tiny" style={{ color: 'var(--ink-4)' }}>
+                                    {manual.product.ref && <span style={{ fontFamily: 'var(--font-mono)' }}>{manual.product.ref} · </span>}
+                                    {manual.product.fournisseur}
+                                  </div>
+                                  <span style={{ marginTop: 4, display: 'inline-block', fontSize: 11, fontWeight: 700, color: manual.source === 'batiprix' ? 'var(--violet-700)' : 'var(--brand-700)', background: manual.source === 'batiprix' ? '#ede9fe' : 'var(--brand-50)', padding: '2px 7px', borderRadius: 20 }}>
+                                    {manual.source === 'batiprix' ? 'Batiprix' : 'Catalogue'} {Math.round(manual.score * 100)}%
+                                  </span>
+                                </div>
+                              </label>
+                            ) : (
+                              <div className="tiny muted" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                                <span>Aucune sélection manuelle</span>
+                                <button className="btn sm ghost" onClick={() => openManualCatalogPicker(m.line, 'modal-select')}>
+                                  Rechercher…
+                                </button>
+                              </div>
+                            )}
+                            {manual && (
+                              <div style={{ marginTop: 8 }}>
+                                <button className="btn sm ghost" onClick={() => openManualCatalogPicker(m.line, 'modal-select')}>
+                                  Modifier…
+                                </button>
+                              </div>
+                            )}
+                          </td>
+                          <td style={{ padding: '10px 12px', textAlign: 'right', fontFamily: 'var(--font-mono)', color: 'var(--ink-3)' }}>
+                            {selectedMatch ? fmt(selectedMatch.product.prixAchat) : '—'}
+                          </td>
                           <td style={{ padding: '10px 12px', textAlign: 'center' }}>
                             <input type="number" step="0.05" min="1" max="5"
                               value={coeffOverrides[m.lineId] ?? ''}
@@ -929,11 +1113,15 @@ export function TenderMatchScreen() {
                               style={{ width: 64, padding: '3px 6px', border: '1px solid var(--line)', borderRadius: 6, fontSize: 12, textAlign: 'right', outline: 'none', fontFamily: 'var(--font-mono)' }}
                             />
                           </td>
-                          <td style={{ padding: '10px 12px', textAlign: 'right', fontFamily: 'var(--font-mono)', fontWeight: 700, color: 'var(--green-700)', fontSize: 14 }}>{fmt(puPropose)}</td>
+                          <td style={{ padding: '10px 12px', textAlign: 'right', fontFamily: 'var(--font-mono)', fontWeight: 700, color: 'var(--green-700)', fontSize: 14 }}>{selectedMatch ? fmt(puPropose) : '—'}</td>
                           <td style={{ padding: '10px 12px', textAlign: 'center' }}>
-                            <span style={{ fontSize: 11, fontWeight: 700, color: scoreColor, background: scoreColor + '18', padding: '2px 7px', borderRadius: 20 }}>
-                              {Math.round(m.score * 100)}%
-                            </span>
+                            <button
+                              className="btn sm ghost"
+                              onClick={() => setSelectedMatchChoice((p) => ({ ...p, [m.lineId]: null }))}
+                              disabled={!choice}
+                            >
+                              Aucun
+                            </button>
                           </td>
                         </tr>
                       );
@@ -951,6 +1139,92 @@ export function TenderMatchScreen() {
                     {Icons.check} Appliquer {selected.length} prix
                   </button>
                 </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {manualCatalogPicker && (() => {
+        const line = lines.find((item) => item.id === manualCatalogPicker.lineId);
+        return (
+          <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 5200, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+            <div className="card" style={{ width: '100%', maxWidth: 920, maxHeight: '82vh', display: 'flex', flexDirection: 'column', padding: 0, boxShadow: 'var(--shadow-lg)' }}>
+              <div style={{ padding: '18px 24px 14px', borderBottom: '1px solid var(--line)', display: 'flex', alignItems: 'center', gap: 12 }}>
+                <span style={{ width: 36, height: 36, borderRadius: 10, background: '#eff6ff', color: 'var(--brand-700)', display: 'grid', placeItems: 'center' }}>{Icons.search}</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600, fontSize: 16 }}>Recherche manuelle</div>
+                  <div className="tiny muted">{line ? getLineDescription(line) : ''}</div>
+                </div>
+                <button className="btn ghost" onClick={() => setManualCatalogPicker(null)} style={{ fontSize: 18, padding: '4px 10px' }}>×</button>
+              </div>
+
+              <div style={{ padding: '16px 24px', borderBottom: '1px solid var(--line-soft)', display: 'flex', gap: 10, alignItems: 'center' }}>
+                <input
+                  autoFocus
+                  value={manualCatalogPicker.query}
+                  onChange={(e) => updateManualCatalogQuery(e.target.value)}
+                  placeholder="Tape une désignation, une référence, un synonyme métier…"
+                  style={{ flex: 1, padding: '10px 12px', border: '1px solid var(--line)', borderRadius: 9, fontSize: 13.5, outline: 'none' }}
+                />
+                <div className="tiny muted">Coeff. actuel {globalCoeff}</div>
+              </div>
+
+              <div style={{ overflowY: 'auto', flex: 1 }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                  <thead>
+                    <tr style={{ background: 'var(--bg-soft)', position: 'sticky', top: 0, zIndex: 5 }}>
+                      <th style={{ padding: '9px 12px', textAlign: 'left', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Type</th>
+                      <th style={{ padding: '9px 12px', textAlign: 'left', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Référence</th>
+                      <th style={{ padding: '9px 12px', textAlign: 'right', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>PA HT</th>
+                      <th style={{ padding: '9px 12px', textAlign: 'right', fontSize: 11, color: 'var(--green-700)', fontWeight: 600 }}>PU appliqué</th>
+                      <th style={{ padding: '9px 12px', textAlign: 'center', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Match</th>
+                      <th style={{ padding: '9px 12px', textAlign: 'center', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {manualCatalogPicker.results.map((entry, idx) => {
+                      const c = parseFloat(globalCoeff.replace(',', '.')) || 1.4;
+                      const pu = parseFloat((entry.product.prixAchat * c).toFixed(2));
+                      const isBatiprix = entry.source === 'batiprix';
+                      return (
+                        <tr key={`${entry.product.id}-${idx}`} style={{ borderBottom: '1px solid var(--line-soft)' }}>
+                          <td style={{ padding: '10px 12px' }}>
+                            <span style={{ fontSize: 11, fontWeight: 700, color: isBatiprix ? 'var(--violet-700)' : 'var(--green-700)', background: isBatiprix ? '#ede9fe' : '#dcfce7', padding: '2px 7px', borderRadius: 20 }}>
+                              {isBatiprix ? 'Batiprix' : 'Catalogue'}
+                            </span>
+                          </td>
+                          <td style={{ padding: '10px 12px' }}>
+                            <div style={{ fontSize: 13 }}>{entry.product.description}</div>
+                            <div className="tiny" style={{ color: 'var(--ink-4)' }}>
+                              {entry.product.ref && <span style={{ fontFamily: 'var(--font-mono)' }}>{entry.product.ref} · </span>}
+                              {entry.product.fournisseur}
+                            </div>
+                          </td>
+                          <td style={{ padding: '10px 12px', textAlign: 'right', fontFamily: 'var(--font-mono)' }}>{fmt(entry.product.prixAchat)}</td>
+                          <td style={{ padding: '10px 12px', textAlign: 'right', fontFamily: 'var(--font-mono)', fontWeight: 700, color: 'var(--green-700)' }}>{fmt(pu)}</td>
+                          <td style={{ padding: '10px 12px', textAlign: 'center' }}>
+                            <span style={{ fontSize: 11, fontWeight: 700, color: isBatiprix ? 'var(--violet-700)' : 'var(--brand-700)', background: isBatiprix ? '#ede9fe' : 'var(--brand-50)', padding: '2px 7px', borderRadius: 20 }}>
+                              {Math.round(entry.score * 100)}%
+                            </span>
+                          </td>
+                          <td style={{ padding: '10px 12px', textAlign: 'center' }}>
+                            <button className="btn sm brand" onClick={() => applyManualCatalogChoice(entry)}>
+                              Choisir
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {manualCatalogPicker.results.length === 0 && (
+                      <tr>
+                        <td colSpan={6} style={{ padding: 30, textAlign: 'center', color: 'var(--ink-4)' }}>
+                          Aucune proposition trouvée pour cette recherche.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
               </div>
             </div>
           </div>

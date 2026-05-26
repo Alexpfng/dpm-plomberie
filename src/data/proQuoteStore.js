@@ -1,9 +1,11 @@
 import * as XLSX from 'xlsx';
 import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
-import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 import { loadCatalog } from './catalogStore';
 
-GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+GlobalWorkerOptions.workerSrc = new URL(
+  'pdfjs-dist/legacy/build/pdf.worker.min.mjs',
+  import.meta.url
+).toString();
 
 const KEY = 'dpm_pro_quotes';
 const STOP = new Set(['de', 'du', 'des', 'le', 'la', 'les', 'en', 'et', 'au', 'aux', 'un', 'une', 'par', 'sur', 'sous', 'dans', 'pour', 'avec', 'sans', 'ou', 'a', 'l', 'd', 'est', 'sont', 'cette', 'tout', 'tous']);
@@ -37,6 +39,22 @@ function toNum(v, fallback = 0) {
 
 function lineBucketY(item) {
   return Math.round((item.transform?.[5] ?? 0) * 2) / 2;
+}
+
+function readPdfArrayBuffer(file) {
+  if (file && typeof file.arrayBuffer === 'function') {
+    return file.arrayBuffer().catch(() => readPdfArrayBufferFallback(file));
+  }
+  return readPdfArrayBufferFallback(file);
+}
+
+function readPdfArrayBufferFallback(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('Impossible de lire le fichier PDF.'));
+    reader.readAsArrayBuffer(file);
+  });
 }
 
 function lineBucketX(item) {
@@ -126,7 +144,7 @@ function parseProQuoteLine(line, index) {
 }
 
 async function extractPdfLines(file) {
-  const buf = await file.arrayBuffer();
+  const buf = await readPdfArrayBuffer(file);
   const pdf = await getDocument({ data: buf }).promise;
   const lines = [];
 
