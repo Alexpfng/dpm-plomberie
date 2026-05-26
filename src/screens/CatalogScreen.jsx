@@ -47,26 +47,29 @@ export default function CatalogScreen() {
 
   // Charge depuis Supabase au montage, met à jour le cache local
   useEffect(() => {
-    // cancelled évite les mises à jour d'état après démontage
-    // (React StrictMode déclenche les effets deux fois en développement)
     let cancelled = false;
 
-    // Affichage immédiat du cache local, sans startTransition
-    // (les produits fantômes vides sont filtrés par loadLocal)
     const cachedProducts = loadCatalog();
     if (cachedProducts.length) {
       setProducts(cachedProducts);
       setLoadingCatalog(false);
     }
 
-    // Chargement Supabase — mise à jour directe (sans startTransition)
-    // pour éviter que setLoadingCatalog(false) s'exécute avant setProducts
+    // Timeout de 20 s : Supabase free-tier peut mettre 30-60 s à se réveiller
+    const timeoutId = setTimeout(() => {
+      if (cancelled) return;
+      setLoadingCatalog(false);
+      setLoadError('Le chargement Supabase prend trop de temps. Votre projet est peut-être en veille — attendez 30 secondes puis actualisez la page.');
+    }, 20000);
+
+    // matchFields:false = champs légers (pas description_cctp/search_text)
+    // → pages ~3× plus légères, chargement beaucoup plus rapide
     loadCatalogFromDB((progressProducts) => {
       if (cancelled) return;
       setProducts(progressProducts);
       setLoadError('');
       setLoadingCatalog(false);
-    })
+    }, { matchFields: false })
       .then((loadedProducts) => {
         if (cancelled) return;
         setProducts(loadedProducts);
@@ -81,10 +84,14 @@ export default function CatalogScreen() {
         setLoadingCatalog(false);
       })
       .finally(() => {
+        clearTimeout(timeoutId);
         if (!cancelled) setLoadingCatalog(false);
       });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+    };
   }, []);
 
   useEffect(() => {

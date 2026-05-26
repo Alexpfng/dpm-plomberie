@@ -5,8 +5,12 @@ import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist/legacy/build/pdf.mj
 const KEY = 'dpm_catalog';
 const TABLE = 'catalog_products';
 const MAX_LOCAL_CACHE_PRODUCTS = 5000;
-const DB_SELECT_FIELDS = 'id,ref,description,unite,prix_achat,prix_vente,fournisseur,famille,description_cctp,search_text,source,source_sheet';
+// Champs légers pour l'affichage seul (sans description_cctp/search_text qui alourdissent les pages)
+const DB_DISPLAY_FIELDS = 'id,ref,description,unite,prix_achat,prix_vente,fournisseur,famille,source,source_sheet';
+// Champs complets pour le matching DPGF/CCTP (TenderMatchScreen)
+const DB_MATCH_FIELDS = 'id,ref,description,unite,prix_achat,prix_vente,fournisseur,famille,description_cctp,search_text,source,source_sheet';
 let memoryCatalog = null;
+let memoryCatalogHasMatchFields = false;
 
 GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/legacy/build/pdf.worker.min.mjs',
@@ -75,10 +79,13 @@ function mergeCatalogMetadata(products) {
   });
 }
 
-function setCatalogCache(products) {
+function setCatalogCache(products, hasMatchFields = false) {
   memoryCatalog = products;
+  memoryCatalogHasMatchFields = hasMatchFields;
   saveLocal(products);
 }
+
+export function catalogHasMatchFields() { return memoryCatalogHasMatchFields; }
 
 // ─── SUPABASE PERSISTENCE ─────────────────────────────────────────────────────
 
@@ -99,11 +106,19 @@ function mapCatalogRows(rows) {
   }));
 }
 
-export async function loadCatalogFromDB(onProgress) {
+export async function loadCatalogFromDB(onProgress, { matchFields = true } = {}) {
+  const fields = matchFields ? DB_MATCH_FIELDS : DB_DISPLAY_FIELDS;
+
+  // Si l'affichage seul est demandé mais que le catalogue complet est déjà en mémoire, on évite un aller-retour
+  if (!matchFields && memoryCatalog && memoryCatalogHasMatchFields) {
+    if (typeof onProgress === 'function') onProgress(memoryCatalog, { done: true });
+    return memoryCatalog;
+  }
+
   const PAGE = 1000;
   const { data: firstPage, error: firstError } = await supabase
     .from(TABLE)
-    .select(DB_SELECT_FIELDS)
+    .select(fields)
     .order('created_at', { ascending: true })
     .range(0, PAGE - 1);
 
@@ -113,7 +128,7 @@ export async function loadCatalogFromDB(onProgress) {
 
   let allData = firstPage || [];
   let mergedProducts = mergeCatalogMetadata(mapCatalogRows(allData));
-  setCatalogCache(mergedProducts);
+  setCatalogCache(mergedProducts, matchFields);
   if (typeof onProgress === 'function') {
     onProgress(mergedProducts, { done: allData.length < PAGE });
   }
@@ -123,7 +138,7 @@ export async function loadCatalogFromDB(onProgress) {
     while (true) {
       const { data, error } = await supabase
         .from(TABLE)
-        .select(DB_SELECT_FIELDS)
+        .select(fields)
         .order('created_at', { ascending: true })
         .range(from, from + PAGE - 1);
 
@@ -134,7 +149,7 @@ export async function loadCatalogFromDB(onProgress) {
 
       allData = allData.concat(data);
       mergedProducts = mergeCatalogMetadata(mapCatalogRows(allData));
-      setCatalogCache(mergedProducts);
+      setCatalogCache(mergedProducts, matchFields);
       if (typeof onProgress === 'function') {
         onProgress(mergedProducts, { done: data.length < PAGE });
       }
