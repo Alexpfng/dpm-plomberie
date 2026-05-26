@@ -72,52 +72,8 @@ function setCatalogCache(products) {
 
 // ─── SUPABASE PERSISTENCE ─────────────────────────────────────────────────────
 
-export async function loadCatalogFromDB() {
-  const PAGE = 1000;
-  const { data: firstPage, error: firstError, count } = await supabase
-    .from(TABLE)
-    .select(DB_SELECT_FIELDS, { count: 'exact' })
-    .order('created_at', { ascending: true })
-    .range(0, PAGE - 1);
-
-  if (firstError) {
-    throw new Error(formatCatalogError(firstError, 'Chargement du catalogue impossible.'));
-  }
-
-  const total = Number.isFinite(count) ? count : (firstPage?.length || 0);
-  let allData = firstPage || [];
-
-  if (total > PAGE) {
-    const ranges = [];
-    for (let from = PAGE; from < total; from += PAGE) {
-      ranges.push([from, Math.min(from + PAGE - 1, total - 1)]);
-    }
-
-    const CONCURRENCY = 6;
-    for (let i = 0; i < ranges.length; i += CONCURRENCY) {
-      const batch = ranges.slice(i, i + CONCURRENCY);
-      const results = await Promise.all(
-        batch.map(([from, to]) =>
-          supabase
-            .from(TABLE)
-            .select(DB_SELECT_FIELDS)
-            .order('created_at', { ascending: true })
-            .range(from, to)
-        )
-      );
-
-      results.forEach(({ data, error }) => {
-        if (error) {
-          throw new Error(formatCatalogError(error, 'Chargement du catalogue impossible.'));
-        }
-        if (data?.length) {
-          allData = allData.concat(data);
-        }
-      });
-    }
-  }
-
-  const products = allData.map(r => ({
+function mapCatalogRows(rows) {
+  return rows.map(r => ({
     id: r.id,
     ref: r.ref,
     description: r.description,
@@ -131,8 +87,53 @@ export async function loadCatalogFromDB() {
     source: r.source || '',
     sourceSheet: r.source_sheet || '',
   }));
-  const mergedProducts = mergeCatalogMetadata(products);
+}
+
+export async function loadCatalogFromDB(onProgress) {
+  const PAGE = 1000;
+  const { data: firstPage, error: firstError } = await supabase
+    .from(TABLE)
+    .select(DB_SELECT_FIELDS)
+    .order('created_at', { ascending: true })
+    .range(0, PAGE - 1);
+
+  if (firstError) {
+    throw new Error(formatCatalogError(firstError, 'Chargement du catalogue impossible.'));
+  }
+
+  let allData = firstPage || [];
+  let mergedProducts = mergeCatalogMetadata(mapCatalogRows(allData));
   setCatalogCache(mergedProducts);
+  if (typeof onProgress === 'function') {
+    onProgress(mergedProducts, { done: allData.length < PAGE });
+  }
+
+  if (allData.length >= PAGE) {
+    let from = PAGE;
+    while (true) {
+      const { data, error } = await supabase
+        .from(TABLE)
+        .select(DB_SELECT_FIELDS)
+        .order('created_at', { ascending: true })
+        .range(from, from + PAGE - 1);
+
+      if (error) {
+        throw new Error(formatCatalogError(error, 'Chargement du catalogue impossible.'));
+      }
+      if (!data?.length) break;
+
+      allData = allData.concat(data);
+      mergedProducts = mergeCatalogMetadata(mapCatalogRows(allData));
+      setCatalogCache(mergedProducts);
+      if (typeof onProgress === 'function') {
+        onProgress(mergedProducts, { done: data.length < PAGE });
+      }
+
+      if (data.length < PAGE) break;
+      from += PAGE;
+    }
+  }
+
   return mergedProducts;
 }
 

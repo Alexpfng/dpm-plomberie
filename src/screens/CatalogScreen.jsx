@@ -50,21 +50,26 @@ export default function CatalogScreen() {
     const cachedProducts = loadCatalog();
     if (cachedProducts.length) {
       startTransition(() => setProducts(cachedProducts));
+      setLoadingCatalog(false);
     }
 
-    loadCatalogFromDB()
+    loadCatalogFromDB((progressProducts) => {
+      startTransition(() => setProducts(progressProducts));
+      setLoadError('');
+      setLoadingCatalog(false);
+    })
       .then((loadedProducts) => {
         startTransition(() => setProducts(loadedProducts));
         setLoadError('');
+        setLoadingCatalog(false);
       })
       .catch((err) => {
         const message = err?.message || 'Chargement du catalogue impossible.';
         setLoadError(message);
         showToast(message, 'error');
-      })
-      .finally(() => {
         setLoadingCatalog(false);
-      });
+      })
+      .finally(() => {});
   }, []);
 
   useEffect(() => {
