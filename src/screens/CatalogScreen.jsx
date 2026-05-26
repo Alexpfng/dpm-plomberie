@@ -1,9 +1,8 @@
-import { useState, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useState, useRef, useEffect } from 'react';
 import { Sidebar, Topbar, useToast } from '../components/Shared';
 import { Icons } from '../components/Icons';
 import * as XLSX from 'xlsx';
-import { loadCatalog, saveCatalog, parseCatalogExcel } from '../data/catalogStore';
+import { loadCatalog, saveCatalog, loadCatalogFromDB, upsertProductsToDB, deleteProductsFromDB, clearCatalogDB, parseCatalogExcel, parseCatalogPdf } from '../data/catalogStore';
 
 const fmt = n => (parseFloat(n) || 0).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
 
@@ -27,7 +26,6 @@ const DEMO_PRODUCTS = [
 ];
 
 export default function CatalogScreen() {
-  const nav = useNavigate();
   const [products, setProducts] = useState(() => {
     const stored = loadCatalog();
     return stored.length ? stored : [];
@@ -37,42 +35,146 @@ export default function CatalogScreen() {
   const [editId, setEditId] = useState(null);
   const [editData, setEditData] = useState({});
   const [importing, setImporting] = useState(false);
+  const [pendingImport, setPendingImport] = useState(null);
+  const [showBulkDelete, setShowBulkDelete] = useState(false);
+  const [bulkMode, setBulkMode] = useState('fournisseur'); // 'fournisseur' | 'famille' | 'tout'
+  const [bulkTarget, setBulkTarget] = useState('');
+  const [saving, setSaving] = useState(false);
   const [showToast, Toast] = useToast();
   const fileRef = useRef();
 
-  const save = (next) => { setProducts(next); saveCatalog(next); };
+  // Charge depuis Supabase au montage, met à jour le cache local
+  useEffect(() => {
+    loadCatalogFromDB().then(setProducts).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!saving) return undefined;
+
+    const handleBeforeUnload = (event) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [saving]);
 
   const handleImport = async (file) => {
     setImporting(true);
     try {
-      const imported = await parseCatalogExcel(file);
-      const next = [...products, ...imported];
-      save(next);
-      showToast(`${imported.length} produits importés`, 'success');
+      const parsed = file.name.toLowerCase().endsWith('.pdf')
+        ? await parseCatalogPdf(file)
+        : await parseCatalogExcel(file);
+      setPendingImport({ products: parsed, supplierName: '' });
     } catch (err) {
       showToast(err.message, 'error');
     } finally { setImporting(false); }
   };
 
-  const loadDemo = () => { save(DEMO_PRODUCTS); showToast('Base de démonstration chargée', 'success'); };
+  const confirmImport = async () => {
+    if (!pendingImport) return;
+    const { products: parsed, supplierName } = pendingImport;
+    setPendingImport(null);
+    const supplier = supplierName.trim();
+    const withSupplier = parsed.map(p => ({ ...p, fournisseur: supplier || p.fournisseur }));
+    const next = [...products, ...withSupplier];
+    setProducts(next);
+    saveCatalog(next);
+
+    setSaving(true);
+    try {
+      await upsertProductsToDB(withSupplier);
+      showToast(`${withSupplier.length} produits importés et enregistrés`, 'success');
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const loadDemo = async () => {
+    setProducts(DEMO_PRODUCTS);
+    saveCatalog(DEMO_PRODUCTS);
+    setSaving(true);
+    try {
+      await upsertProductsToDB(DEMO_PRODUCTS);
+      showToast('Base de démonstration chargée et enregistrée', 'success');
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
 
   const startEdit = (p) => { setEditId(p.id); setEditData({ ...p }); };
   const cancelEdit = () => { setEditId(null); setEditData({}); };
-  const commitEdit = () => {
-    save(products.map(p => p.id === editId ? { ...p, ...editData } : p));
-    setEditId(null);
-    showToast('Produit mis à jour', 'success');
+  const commitEdit = async () => {
+    const updated = { ...products.find(p => p.id === editId), ...editData };
+    const next = products.map(p => p.id === editId ? updated : p);
+    setProducts(next);
+    saveCatalog(next);
+    setSaving(true);
+    try {
+      await upsertProductsToDB([updated]);
+      setEditId(null);
+      showToast('Produit mis à jour', 'success');
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const deleteProduct = (id) => {
-    save(products.filter(p => p.id !== id));
-    showToast('Produit supprimé', 'success');
+  const deleteProduct = async (id) => {
+    const next = products.filter(p => p.id !== id);
+    setProducts(next);
+    saveCatalog(next);
+    setSaving(true);
+    try {
+      await deleteProductsFromDB([id]);
+      showToast('Produit supprimé', 'success');
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setSaving(false);
+    }
   };
+
+  const confirmBulkDelete = async () => {
+    let next, deletedIds;
+    if (bulkMode === 'tout') {
+      next = []; deletedIds = products.map(p => p.id);
+    } else if (bulkMode === 'fournisseur') {
+      next = products.filter(p => p.fournisseur !== bulkTarget);
+      deletedIds = products.filter(p => p.fournisseur === bulkTarget).map(p => p.id);
+    } else {
+      next = products.filter(p => p.famille !== bulkTarget);
+      deletedIds = products.filter(p => p.famille === bulkTarget).map(p => p.id);
+    }
+    setProducts(next);
+    saveCatalog(next);
+    setSaving(true);
+    try {
+      if (bulkMode === 'tout') await clearCatalogDB();
+      else await deleteProductsFromDB(deletedIds);
+      showToast(`${deletedIds.length} produit${deletedIds.length > 1 ? 's' : ''} supprimé${deletedIds.length > 1 ? 's' : ''}`, 'success');
+      setShowBulkDelete(false);
+      setBulkTarget('');
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const suppliers = [...new Set(products.map(p => p.fournisseur).filter(Boolean))].sort();
 
   const addRow = () => {
     const newP = { id: `new-${Date.now()}`, ref: '', description: '', unite: 'u', prixAchat: 0, fournisseur: '', famille: '' };
     const next = [newP, ...products];
-    save(next);
+    setProducts(next);
+    saveCatalog(next);
     startEdit(newP);
   };
 
@@ -110,11 +212,18 @@ export default function CatalogScreen() {
           right={
             <>
               <button className="btn" onClick={exportCatalog} disabled={!products.length}>{Icons.download} Exporter</button>
-              <button className="btn" onClick={() => fileRef.current.click()} disabled={importing}>
-                {importing ? '⏳' : Icons.upload} {importing ? 'Import…' : 'Importer Excel'}
+              {products.length > 0 && (
+                <button className="btn" onClick={() => { setShowBulkDelete(true); setBulkMode('fournisseur'); setBulkTarget(suppliers[0] || ''); }}
+                  disabled={saving}
+                  style={{ color: 'var(--red-500)', borderColor: 'var(--red-200)' }}>
+                  🗑 Supprimer en masse
+                </button>
+              )}
+              <button className="btn" onClick={() => fileRef.current.click()} disabled={importing || saving}>
+                {(importing || saving) ? '⏳' : Icons.upload} {importing ? 'Import…' : saving ? 'Enregistrement…' : 'Importer'}
               </button>
-              <button className="btn brand" onClick={addRow}>{Icons.plus} Ajouter</button>
-              <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" style={{ display: 'none' }} onChange={e => { if (e.target.files[0]) handleImport(e.target.files[0]); e.target.value = ''; }} />
+              <button className="btn brand" onClick={addRow} disabled={saving}>{Icons.plus} Ajouter</button>
+              <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv,.pdf" style={{ display: 'none' }} onChange={e => { if (e.target.files[0]) handleImport(e.target.files[0]); e.target.value = ''; }} />
             </>
           }
         />
@@ -146,7 +255,9 @@ export default function CatalogScreen() {
             <option value="">Toutes familles</option>
             {families.map(f => <option key={f} value={f}>{f}</option>)}
           </select>
-          <span className="tiny muted">{displayed.length} produit{displayed.length > 1 ? 's' : ''}</span>
+          <span className="tiny muted">
+            {saving ? 'Enregistrement du catalogue en cours…' : `${displayed.length} produit${displayed.length > 1 ? 's' : ''}`}
+          </span>
         </div>
 
         {/* Empty state */}
@@ -249,6 +360,87 @@ export default function CatalogScreen() {
         )}
       </div>
       {Toast}
+
+      {/* Modale suppression en masse */}
+      {showBulkDelete && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: '#fff', borderRadius: 14, padding: 32, width: 440, boxShadow: '0 20px 60px rgba(0,0,0,0.2)' }}>
+            <div style={{ fontWeight: 700, fontSize: 17, marginBottom: 4 }}>Suppression en masse</div>
+            <div style={{ fontSize: 13, color: 'var(--ink-3)', marginBottom: 20 }}>Choisissez ce que vous souhaitez supprimer.</div>
+
+            {/* Onglets de mode */}
+            <div style={{ display: 'flex', gap: 6, marginBottom: 18 }}>
+              {[['fournisseur', 'Par fournisseur'], ['famille', 'Par famille'], ['tout', 'Tout vider']].map(([mode, label]) => (
+                <button key={mode} onClick={() => { setBulkMode(mode); setBulkTarget(mode === 'fournisseur' ? suppliers[0] || '' : mode === 'famille' ? families[0] || '' : ''); }}
+                  style={{ flex: 1, padding: '7px 10px', borderRadius: 8, fontSize: 12, fontWeight: 600, border: '2px solid', cursor: 'pointer',
+                    borderColor: bulkMode === mode ? (mode === 'tout' ? 'var(--red-400)' : 'var(--brand-400)') : 'var(--line)',
+                    background: bulkMode === mode ? (mode === 'tout' ? 'var(--red-50, #fff5f5)' : 'var(--brand-50)') : '#fff',
+                    color: bulkMode === mode ? (mode === 'tout' ? 'var(--red-600)' : 'var(--brand-700)') : 'var(--ink-3)' }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {bulkMode === 'fournisseur' && (
+              <>
+                <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Fournisseur</label>
+                <select value={bulkTarget} onChange={e => setBulkTarget(e.target.value)}
+                  style={{ display: 'block', width: '100%', marginTop: 6, marginBottom: 20, padding: '10px 14px', border: '2px solid var(--line)', borderRadius: 8, fontSize: 14, outline: 'none' }}>
+                  {suppliers.map(s => <option key={s} value={s}>{s} — {products.filter(p => p.fournisseur === s).length} produits</option>)}
+                </select>
+              </>
+            )}
+
+            {bulkMode === 'famille' && (
+              <>
+                <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Famille</label>
+                <select value={bulkTarget} onChange={e => setBulkTarget(e.target.value)}
+                  style={{ display: 'block', width: '100%', marginTop: 6, marginBottom: 20, padding: '10px 14px', border: '2px solid var(--line)', borderRadius: 8, fontSize: 14, outline: 'none' }}>
+                  {families.map(f => <option key={f} value={f}>{f} — {products.filter(p => p.famille === f).length} produits</option>)}
+                </select>
+              </>
+            )}
+
+            {bulkMode === 'tout' && (
+              <div style={{ marginBottom: 20, padding: '12px 16px', background: 'var(--red-50, #fff5f5)', border: '1px solid var(--red-200, #fecaca)', borderRadius: 8, fontSize: 13, color: 'var(--red-600)' }}>
+                Tous les <strong>{products.length} produits</strong> seront supprimés. Cette action est irréversible.
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button className="btn" onClick={() => setShowBulkDelete(false)}>Annuler</button>
+              <button className="btn" onClick={confirmBulkDelete}
+                disabled={saving || (bulkMode !== 'tout' && !bulkTarget)}
+                style={{ background: 'var(--red-500)', color: '#fff', borderColor: 'var(--red-500)', opacity: (bulkMode !== 'tout' && !bulkTarget) ? 0.5 : 1 }}>
+                Supprimer {bulkMode === 'tout' ? 'tout' : bulkMode === 'fournisseur' ? `"${bulkTarget}"` : `famille "${bulkTarget}"`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modale fournisseur à l'import */}
+      {pendingImport && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: '#fff', borderRadius: 14, padding: 32, width: 420, boxShadow: '0 20px 60px rgba(0,0,0,0.2)' }}>
+            <div style={{ fontWeight: 700, fontSize: 17, marginBottom: 6 }}>Importer {pendingImport.products.length} produits</div>
+            <div style={{ fontSize: 13, color: 'var(--ink-3)', marginBottom: 20 }}>Quel fournisseur associer à cet import ?</div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Fournisseur</label>
+            <input
+              autoFocus
+              value={pendingImport.supplierName}
+              onChange={e => setPendingImport(p => ({ ...p, supplierName: e.target.value }))}
+              onKeyDown={e => { if (e.key === 'Enter') confirmImport(); if (e.key === 'Escape') setPendingImport(null); }}
+              placeholder="Ex : Apollo, Grohe, Nicoll…"
+              style={{ display: 'block', width: '100%', marginTop: 6, marginBottom: 24, padding: '10px 14px', border: '2px solid var(--brand-400)', borderRadius: 8, fontSize: 14, outline: 'none', boxSizing: 'border-box' }}
+            />
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button className="btn" onClick={() => setPendingImport(null)} disabled={saving}>Annuler</button>
+              <button className="btn brand" onClick={confirmImport} disabled={saving}>Importer</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
