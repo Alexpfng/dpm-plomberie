@@ -82,6 +82,29 @@ CREATE TABLE public.gmail_tokens (
   updated_at timestamptz DEFAULT now() NOT NULL
 );
 
+CREATE TABLE public.catalog_products (
+  id text PRIMARY KEY,
+  ref text DEFAULT '' NOT NULL,
+  description text DEFAULT '' NOT NULL,
+  unite text DEFAULT '' NOT NULL,
+  prix_achat numeric(12,2) DEFAULT 0 NOT NULL,
+  prix_vente numeric(12,2) DEFAULT 0 NOT NULL,
+  fournisseur text DEFAULT '' NOT NULL,
+  famille text DEFAULT '' NOT NULL,
+  description_cctp text DEFAULT '' NOT NULL,
+  search_text text DEFAULT '' NOT NULL,
+  source text DEFAULT '' NOT NULL,
+  source_sheet text DEFAULT '' NOT NULL,
+  created_at timestamptz DEFAULT now() NOT NULL,
+  updated_at timestamptz DEFAULT now() NOT NULL
+);
+
+ALTER TABLE public.catalog_products ADD COLUMN IF NOT EXISTS prix_vente numeric(12,2) DEFAULT 0 NOT NULL;
+ALTER TABLE public.catalog_products ADD COLUMN IF NOT EXISTS description_cctp text DEFAULT '' NOT NULL;
+ALTER TABLE public.catalog_products ADD COLUMN IF NOT EXISTS search_text text DEFAULT '' NOT NULL;
+ALTER TABLE public.catalog_products ADD COLUMN IF NOT EXISTS source text DEFAULT '' NOT NULL;
+ALTER TABLE public.catalog_products ADD COLUMN IF NOT EXISTS source_sheet text DEFAULT '' NOT NULL;
+
 -- ── Profiles (avec crm_role) ──
 CREATE TABLE public.profiles (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -236,7 +259,7 @@ BEGIN
     'call_sessions','reminders','scripts','email_templates','tags',
     'prospect_tags','companies','custom_fields','custom_field_values',
     'daily_stats','email_automations','saved_mappings','sms_templates',
-    'gmail_tokens','user_roles'
+    'gmail_tokens','user_roles','catalog_products'
   ]) LOOP
     EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format(
@@ -277,6 +300,19 @@ BEGIN
   RETURN v_score;
 END;
 $$;
+
+CREATE OR REPLACE FUNCTION public.set_updated_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS catalog_products_set_updated_at ON public.catalog_products;
+CREATE TRIGGER catalog_products_set_updated_at
+  BEFORE UPDATE ON public.catalog_products
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 
 -- ── Trigger auto-création de profil à l'inscription ──
 CREATE OR REPLACE FUNCTION public.handle_new_user()

@@ -26,10 +26,7 @@ const DEMO_PRODUCTS = [
 ];
 
 export default function CatalogScreen() {
-  const [products, setProducts] = useState(() => {
-    const stored = loadCatalog();
-    return stored.length ? stored : [];
-  });
+  const [products, setProducts] = useState([]);
   const [search, setSearch] = useState('');
   const [familyFilter, setFamilyFilter] = useState('');
   const [editId, setEditId] = useState(null);
@@ -40,12 +37,31 @@ export default function CatalogScreen() {
   const [bulkMode, setBulkMode] = useState('fournisseur'); // 'fournisseur' | 'famille' | 'tout'
   const [bulkTarget, setBulkTarget] = useState('');
   const [saving, setSaving] = useState(false);
+  const [loadingCatalog, setLoadingCatalog] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [showToast, Toast] = useToast();
   const fileRef = useRef();
 
   // Charge depuis Supabase au montage, met à jour le cache local
   useEffect(() => {
-    loadCatalogFromDB().then(setProducts).catch(() => {});
+    const cachedProducts = loadCatalog();
+    if (cachedProducts.length) {
+      setProducts(cachedProducts);
+    }
+
+    loadCatalogFromDB()
+      .then((loadedProducts) => {
+        setProducts(loadedProducts);
+        setLoadError('');
+      })
+      .catch((err) => {
+        const message = err?.message || 'Chargement du catalogue impossible.';
+        setLoadError(message);
+        showToast(message, 'error');
+      })
+      .finally(() => {
+        setLoadingCatalog(false);
+      });
   }, []);
 
   useEffect(() => {
@@ -66,7 +82,8 @@ export default function CatalogScreen() {
       const parsed = file.name.toLowerCase().endsWith('.pdf')
         ? await parseCatalogPdf(file)
         : await parseCatalogExcel(file);
-      setPendingImport({ products: parsed, supplierName: '' });
+      const isBatiprixImport = parsed.every((product) => product.source === 'batiprix');
+      setPendingImport({ products: parsed, supplierName: isBatiprixImport ? 'Batiprix' : '' });
     } catch (err) {
       showToast(err.message, 'error');
     } finally { setImporting(false); }
@@ -180,10 +197,10 @@ export default function CatalogScreen() {
 
   const exportCatalog = () => {
     const ws = XLSX.utils.aoa_to_sheet([
-      ['Référence', 'Désignation', 'Unité', 'Prix achat HT', 'Fournisseur', 'Famille'],
-      ...products.map(p => [p.ref, p.description, p.unite, p.prixAchat, p.fournisseur, p.famille]),
+      ['Référence', 'Désignation', 'Unité', 'Prix achat HT', 'Prix vente HT', 'Fournisseur', 'Famille', 'Description / Infos CCTP'],
+      ...products.map(p => [p.ref, p.description, p.unite, p.prixAchat, p.prixVente || '', p.fournisseur, p.famille, p.descriptionCctp || '']),
     ]);
-    ws['!cols'] = [{ wch: 12 }, { wch: 50 }, { wch: 8 }, { wch: 14 }, { wch: 16 }, { wch: 16 }];
+    ws['!cols'] = [{ wch: 18 }, { wch: 50 }, { wch: 8 }, { wch: 14 }, { wch: 14 }, { wch: 16 }, { wch: 16 }, { wch: 80 }];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Catalogue');
     XLSX.writeFile(wb, 'Catalogue_produits_DPM.xlsx');
@@ -260,8 +277,20 @@ export default function CatalogScreen() {
           </span>
         </div>
 
+        {loadError && (
+          <div style={{ margin: '16px 24px 0', padding: '12px 14px', borderRadius: 10, background: '#fff4e5', border: '1px solid #f5c27a', color: '#8a4b08', fontSize: 13 }}>
+            <strong>Catalogue distant indisponible.</strong> {loadError}
+          </div>
+        )}
+
+        {loadingCatalog && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 220, color: 'var(--ink-4)', fontSize: 14 }}>
+            Chargement du catalogue distant…
+          </div>
+        )}
+
         {/* Empty state */}
-        {products.length === 0 && (
+        {!loadingCatalog && products.length === 0 && (
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: 340, gap: 12, color: 'var(--ink-4)' }}>
             <div style={{ fontSize: 40 }}>📦</div>
             <div style={{ fontWeight: 600, fontSize: 16, color: 'var(--ink-2)' }}>Aucun produit dans la base</div>
@@ -274,7 +303,7 @@ export default function CatalogScreen() {
         )}
 
         {/* Table */}
-        {products.length > 0 && (
+        {!loadingCatalog && products.length > 0 && (
           <div className="page-content" style={{ padding: 0 }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
               <thead>
@@ -355,7 +384,7 @@ export default function CatalogScreen() {
         {/* Format hint */}
         {products.length === 0 && (
           <div style={{ margin: '0 24px', padding: '14px 18px', background: 'var(--bg-soft)', border: '1px solid var(--line)', borderRadius: 10, fontSize: 12.5, color: 'var(--ink-3)' }}>
-            <strong>Format Excel attendu :</strong> colonnes <em>Référence</em>, <em>Désignation</em>, <em>Unité</em>, <em>Prix achat HT</em>, <em>Fournisseur</em>, <em>Famille</em> — les en-têtes sont détectées automatiquement.
+            <strong>Formats Excel acceptés :</strong> catalogue standard avec colonnes <em>Référence</em>, <em>Désignation</em>, <em>Unité</em>, <em>Prix achat HT</em>, <em>Fournisseur</em>, <em>Famille</em>, ou export <em>Batiprix</em> avec colonnes <em>Code</em>, <em>Ouvrage</em>, <em>Prix achat HT (€)</em>, <em>Prix vente HT (€)</em>, <em>Description / Infos CCTP</em>.
           </div>
         )}
       </div>
@@ -424,7 +453,9 @@ export default function CatalogScreen() {
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <div style={{ background: '#fff', borderRadius: 14, padding: 32, width: 420, boxShadow: '0 20px 60px rgba(0,0,0,0.2)' }}>
             <div style={{ fontWeight: 700, fontSize: 17, marginBottom: 6 }}>Importer {pendingImport.products.length} produits</div>
-            <div style={{ fontSize: 13, color: 'var(--ink-3)', marginBottom: 20 }}>Quel fournisseur associer à cet import ?</div>
+            <div style={{ fontSize: 13, color: 'var(--ink-3)', marginBottom: 20 }}>
+              Quel fournisseur associer à cet import ? {pendingImport.products.every((product) => product.source === 'batiprix') ? 'Le format Batiprix est prérempli.' : ''}
+            </div>
             <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Fournisseur</label>
             <input
               autoFocus

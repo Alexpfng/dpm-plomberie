@@ -2,20 +2,64 @@ import * as XLSX from 'xlsx';
 import { createClient } from '@supabase/supabase-js';
 
 const KEY = 'dpm_catalog';
+const TABLE = 'catalog_products';
+let memoryCatalog = null;
+let catalogKeywordIndex = null;
+let indexedCatalogRef = null;
+
+const EXTRA_FIELDS = ['source', 'sourceSheet', 'prixVente', 'descriptionCctp', 'searchText'];
 
 const supabase = createClient(
   import.meta.env.VITE_SUPABASE_URL,
   import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY
 );
 
+function formatCatalogError(error, fallbackMessage) {
+  const message = error?.message || fallbackMessage;
+
+  if (message.includes(`Could not find the table 'public.${TABLE}'`)) {
+    return 'La table Supabase "catalog_products" est absente. Exécute le schéma SQL mis à jour avant de réimporter le catalogue.';
+  }
+
+  return message;
+}
+
 // ─── LOCAL CACHE ──────────────────────────────────────────────────────────────
 
 function saveLocal(products) {
-  try { localStorage.setItem(KEY, JSON.stringify(products)); } catch {}
+  try {
+    localStorage.setItem(KEY, JSON.stringify(products));
+  } catch {
+    try { localStorage.removeItem(KEY); } catch {}
+  }
 }
 
 function loadLocal() {
   try { return JSON.parse(localStorage.getItem(KEY) || '[]'); } catch { return []; }
+}
+
+function mergeCatalogMetadata(products) {
+  const previous = loadLocal();
+  const byId = new Map(previous.map((product) => [product.id, product]));
+  const byRef = new Map(previous.filter((product) => product.ref).map((product) => [product.ref, product]));
+
+  return products.map((product) => {
+    const previousProduct = byId.get(product.id) || (product.ref ? byRef.get(product.ref) : null);
+    if (!previousProduct) return product;
+
+    const extras = {};
+    EXTRA_FIELDS.forEach((field) => {
+      if (previousProduct[field]) extras[field] = previousProduct[field];
+    });
+    return Object.keys(extras).length ? { ...product, ...extras } : product;
+  });
+}
+
+function setCatalogCache(products) {
+  memoryCatalog = products;
+  catalogKeywordIndex = null;
+  indexedCatalogRef = products;
+  saveLocal(products);
 }
 
 // ─── SUPABASE PERSISTENCE ─────────────────────────────────────────────────────
@@ -27,11 +71,11 @@ export async function loadCatalogFromDB() {
   let from = 0;
   while (true) {
     const { data, error } = await supabase
-      .from('catalog_products')
+      .from(TABLE)
       .select('*')
       .order('created_at', { ascending: true })
       .range(from, from + PAGE - 1);
-    if (error) throw error;
+    if (error) throw new Error(formatCatalogError(error, 'Chargement du catalogue impossible.'));
     if (!data || data.length === 0) break;
     allData = allData.concat(data);
     if (data.length < PAGE) break;
@@ -43,11 +87,17 @@ export async function loadCatalogFromDB() {
     description: r.description,
     unite: r.unite,
     prixAchat: parseFloat(r.prix_achat),
+    prixVente: parseFloat(r.prix_vente) || 0,
     fournisseur: r.fournisseur,
     famille: r.famille,
+    descriptionCctp: r.description_cctp || '',
+    searchText: r.search_text || '',
+    source: r.source || '',
+    sourceSheet: r.source_sheet || '',
   }));
-  saveLocal(products);
-  return products;
+  const mergedProducts = mergeCatalogMetadata(products);
+  setCatalogCache(mergedProducts);
+  return mergedProducts;
 }
 
 const toRow = p => ({
@@ -56,8 +106,13 @@ const toRow = p => ({
   description: p.description || '',
   unite: p.unite || '',
   prix_achat: p.prixAchat || 0,
+  prix_vente: p.prixVente || 0,
   fournisseur: p.fournisseur || '',
   famille: p.famille || '',
+  description_cctp: p.descriptionCctp || '',
+  search_text: p.searchText || '',
+  source: p.source || '',
+  source_sheet: p.sourceSheet || '',
 });
 
 export async function upsertProductsToDB(products) {
@@ -69,10 +124,10 @@ export async function upsertProductsToDB(products) {
   for (let i = 0; i < products.length; i += CHUNK) {
     const chunk = products.slice(i, i + CHUNK);
     const { error } = await supabase
-      .from('catalog_products')
+      .from(TABLE)
       .upsert(chunk.map(toRow), { onConflict: 'id' });
     if (error) {
-      failures.push(`lot ${Math.floor(i / CHUNK) + 1}: ${error.message}`);
+      failures.push(`lot ${Math.floor(i / CHUNK) + 1}: ${formatCatalogError(error, 'Sauvegarde du catalogue impossible.')}`);
     }
   }
 
@@ -84,23 +139,23 @@ export async function upsertProductsToDB(products) {
 export async function deleteProductsFromDB(ids) {
   if (!ids.length) return;
   const { error } = await supabase
-    .from('catalog_products')
+    .from(TABLE)
     .delete()
     .in('id', ids);
-  if (error) throw new Error(`Suppression catalogue impossible : ${error.message}`);
+  if (error) throw new Error(formatCatalogError(error, 'Suppression catalogue impossible.'));
 }
 
 export async function clearCatalogDB() {
   const { error } = await supabase
-    .from('catalog_products')
+    .from(TABLE)
     .delete()
     .neq('id', '');
-  if (error) throw new Error(`Vidage catalogue impossible : ${error.message}`);
+  if (error) throw new Error(formatCatalogError(error, 'Vidage catalogue impossible.'));
 }
 
 // Compatibilité synchrone (cache local uniquement)
-export function saveCatalog(products) { saveLocal(products); }
-export function loadCatalog() { return loadLocal(); }
+export function saveCatalog(products) { setCatalogCache(products); }
+export function loadCatalog() { return memoryCatalog ?? loadLocal(); }
 
 // ─── EXCEL IMPORT ─────────────────────────────────────────────────────────────
 
@@ -118,14 +173,160 @@ function detectColumns(headerRow) {
   return cols;
 }
 
+function detectBatiprixColumns(headerRow) {
+  const cols = { code: -1, ouvrage: -1, unite: -1, prixAchat: -1, prixVente: -1, descriptionCctp: -1 };
+  headerRow.forEach((cell, i) => {
+    const c = String(cell ?? '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+    if (c === 'code') cols.code = i;
+    else if (c.includes('ouvrage')) cols.ouvrage = i;
+    else if (c.startsWith('uni')) cols.unite = i;
+    else if (c.includes('prix achat')) cols.prixAchat = i;
+    else if (c.includes('prix vente')) cols.prixVente = i;
+    else if (c.includes('description') || c.includes('infos cctp')) cols.descriptionCctp = i;
+  });
+  return cols;
+}
+
+function makeStableId(ref, desc, fallbackIndex) {
+  const base = String(ref || desc || fallbackIndex || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return base || `catalog-${fallbackIndex}`;
+}
+
+function cleanBatiprixText(value) {
+  return String(value ?? '')
+    .replace(/https?:\/\/\S+/gi, ' ')
+    .replace(/Plus d['’]infos/gi, ' ')
+    .replace(/Corps d[’']etat/gi, ' ')
+    .replace(/Plus de filtres/gi, ' ')
+    .replace(/\b\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}\b/g, ' ')
+    .replace(/Batiprix Web - Recherche ouvrages/gi, ' ')
+    .replace(/\b\d+\s*\/\s*\d+\b/g, ' ')
+    .replace(/[þ↑]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function cleanBatiprixDescription(value) {
+  return cleanBatiprixText(value)
+    .replace(/\b\d{2}(?:\s\d{2}){5}\b.*$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function cleanBatiprixLabel(value) {
+  return cleanBatiprixDescription(value)
+    .replace(/\b(?:m²|m3|m²|ml|u|ens|h)\b.*$/i, '')
+    .trim();
+}
+
+function inferBatiprixFamily(code) {
+  const prefix = String(code || '').trim().slice(0, 2);
+  return prefix ? `Batiprix ${prefix}` : 'Batiprix';
+}
+
+function parseBatiprixWorkbook(wb) {
+  const sheetName = wb.SheetNames.find((name) => /ouvrages/i.test(name)) || wb.SheetNames[0];
+  const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, defval: '', raw: false });
+  const cctpSheetName = wb.SheetNames.find((name) => /cctp/i.test(name));
+  const cctpRows = cctpSheetName
+    ? XLSX.utils.sheet_to_json(wb.Sheets[cctpSheetName], { header: 1, defval: '', raw: false })
+    : [];
+
+  const headerIndex = rows.findIndex((row) => {
+    const cols = detectBatiprixColumns(row);
+    return cols.code >= 0 && cols.ouvrage >= 0 && cols.prixAchat >= 0;
+  });
+
+  if (headerIndex === -1) {
+    throw new Error('Format Batiprix non reconnu dans la feuille Ouvrages.');
+  }
+
+  const cols = detectBatiprixColumns(rows[headerIndex]);
+  const cctpHeaderIndex = cctpRows.findIndex((row) => {
+    const detected = detectBatiprixColumns(row);
+    return detected.code >= 0 && detected.ouvrage >= 0;
+  });
+  const cctpCols = cctpHeaderIndex >= 0 ? detectBatiprixColumns(cctpRows[cctpHeaderIndex]) : null;
+
+  const toNum = (v) => {
+    const normalized = String(v ?? '')
+      .replace(/\s/g, '')
+      .replace(/€/g, '')
+      .replace(',', '.');
+    const n = parseFloat(normalized);
+    return Number.isFinite(n) ? n : 0;
+  };
+
+  const cctpByCode = new Map();
+  if (cctpCols) {
+    for (let r = cctpHeaderIndex + 1; r < cctpRows.length; r++) {
+      const row = cctpRows[r];
+      const code = String(row[cctpCols.code] ?? '').trim();
+      if (!code) continue;
+      const descriptionCctp = cleanBatiprixDescription(row[cctpCols.descriptionCctp] ?? '');
+      if (descriptionCctp) cctpByCode.set(code, descriptionCctp);
+    }
+  }
+
+  const products = [];
+  for (let r = headerIndex + 1; r < rows.length; r++) {
+    const row = rows[r];
+    const code = String(row[cols.code] ?? '').trim();
+    const ouvrage = cleanBatiprixLabel(row[cols.ouvrage] ?? '');
+    const prixAchat = toNum(row[cols.prixAchat]);
+    if (!code || !ouvrage || prixAchat <= 0) continue;
+
+    const descriptionCctp = cctpByCode.get(code) || cleanBatiprixDescription(row[cols.descriptionCctp] ?? '');
+    const prixVente = cols.prixVente >= 0 ? toNum(row[cols.prixVente]) : 0;
+    const searchText = [ouvrage, descriptionCctp].filter(Boolean).join(' ');
+
+    products.push({
+      id: `batiprix-${makeStableId(code, ouvrage, r)}`,
+      ref: code,
+      description: ouvrage,
+      unite: cols.unite >= 0 ? String(row[cols.unite] ?? '').trim() : '',
+      prixAchat,
+      fournisseur: 'Batiprix',
+      famille: inferBatiprixFamily(code),
+      prixVente,
+      descriptionCctp,
+      searchText,
+      source: 'batiprix',
+      sourceSheet: sheetName,
+    });
+  }
+
+  if (!products.length) {
+    throw new Error('Aucun ouvrage Batiprix exploitable trouvé dans le fichier.');
+  }
+
+  return products;
+}
+
 export function parseCatalogExcel(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
         const wb = XLSX.read(e.target.result, { type: 'array' });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+        const firstSheetName = wb.SheetNames[0];
+        const ws = wb.Sheets[firstSheetName];
+        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: false });
+
+        const isBatiprixWorkbook = wb.SheetNames.some((name) => /ouvrages/i.test(name))
+          || rows.slice(0, 6).some((row) => {
+            const cols = detectBatiprixColumns(row);
+            return cols.code >= 0 && cols.ouvrage >= 0 && cols.prixAchat >= 0;
+          });
+
+        if (isBatiprixWorkbook) {
+          resolve(parseBatiprixWorkbook(wb));
+          return;
+        }
 
         // Find header row (first row that has a price column)
         let hi = -1;
@@ -151,7 +352,7 @@ export function parseCatalogExcel(file) {
           if (pa <= 0) continue; // skip rows with no price
 
           products.push({
-            id: `${r}-${Date.now()}`,
+            id: `catalog-${makeStableId(ref, desc, r)}`,
             ref,
             description: desc || ref,
             unite:       cols.unite      >= 0 ? String(row[cols.unite]      ?? '').trim() : '',
@@ -174,9 +375,9 @@ export function parseCatalogExcel(file) {
 // ─── PDF IMPORT ───────────────────────────────────────────────────────────────
 
 export async function parseCatalogPdf(file) {
-  const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist');
+  const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist/legacy/build/pdf.mjs');
   GlobalWorkerOptions.workerSrc = new URL(
-    'pdfjs-dist/build/pdf.worker.min.mjs',
+    'pdfjs-dist/legacy/build/pdf.worker.min.mjs',
     import.meta.url
   ).toString();
 
@@ -302,6 +503,23 @@ function keywords(s) {
   return normStr(s).split(' ').filter(w => w.length > 2 && !STOP.has(w));
 }
 
+function getCatalogKeywordIndex(catalog) {
+  if (catalogKeywordIndex && indexedCatalogRef === catalog) return catalogKeywordIndex;
+
+  const buckets = new Map();
+  catalog.forEach((product, idx) => {
+    const terms = [...new Set(keywords(product.searchText || product.description))];
+    terms.forEach((term) => {
+      if (!buckets.has(term)) buckets.set(term, []);
+      buckets.get(term).push(idx);
+    });
+  });
+
+  catalogKeywordIndex = buckets;
+  indexedCatalogRef = catalog;
+  return buckets;
+}
+
 // Score similarity between two descriptions (0–1)
 function similarity(a, b) {
   const ka = new Set(keywords(a));
@@ -315,12 +533,30 @@ function similarity(a, b) {
 // Returns array of { lineId, product, score }
 export function matchCatalogToLines(dpgfLines, catalog) {
   if (!catalog.length) return [];
+  const keywordIndex = getCatalogKeywordIndex(catalog);
+
   return dpgfLines
     .filter(l => !l.isSection)
     .map(l => {
+      const lineKeywords = [...new Set(keywords(l.description))];
+      const candidateIds = new Set();
+
+      lineKeywords.forEach((term) => {
+        const matches = keywordIndex.get(term);
+        if (!matches) return;
+        for (const idx of matches) {
+          candidateIds.add(idx);
+          if (candidateIds.size >= 250) break;
+        }
+      });
+
+      const candidates = candidateIds.size
+        ? [...candidateIds].map(idx => catalog[idx])
+        : catalog.slice(0, 250);
+
       let best = null, bestScore = 0;
-      for (const p of catalog) {
-        const s = similarity(l.description, p.description);
+      for (const p of candidates) {
+        const s = similarity(l.description, p.searchText || p.description);
         if (s > bestScore) { bestScore = s; best = p; }
       }
       if (bestScore < 0.2) return null; // below threshold
