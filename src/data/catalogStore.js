@@ -32,20 +32,30 @@ function formatCatalogError(error, fallbackMessage) {
 
 // ─── LOCAL CACHE ──────────────────────────────────────────────────────────────
 
+function isRealProduct(p) {
+  return p.prixAchat > 0 || (p.description && p.description.trim()) || (p.ref && p.ref.trim());
+}
+
 function saveLocal(products) {
-  if (products.length > MAX_LOCAL_CACHE_PRODUCTS) {
+  // Ne pas persister les lignes fantômes créées par addRow mais jamais validées
+  const toSave = products.filter(isRealProduct);
+  if (toSave.length > MAX_LOCAL_CACHE_PRODUCTS) {
     try { localStorage.removeItem(KEY); } catch { /* trop grand pour le cache local */ }
     return;
   }
   try {
-    localStorage.setItem(KEY, JSON.stringify(products));
+    localStorage.setItem(KEY, JSON.stringify(toSave));
   } catch {
     try { localStorage.removeItem(KEY); } catch {}
   }
 }
 
 function loadLocal() {
-  try { return JSON.parse(localStorage.getItem(KEY) || '[]'); } catch { return []; }
+  try {
+    const data = JSON.parse(localStorage.getItem(KEY) || '[]');
+    // Filtre les produits fantômes déjà enregistrés dans des sessions précédentes
+    return data.filter(isRealProduct);
+  } catch { return []; }
 }
 
 function mergeCatalogMetadata(products) {
@@ -721,7 +731,9 @@ export function searchCatalogOptions(query, catalog, limit = 20, context = '', k
   if (!effectiveNeedle || !catalog.length) return [];
 
   const effectiveKeywordIndex = keywordIndex || getCatalogKeywordIndex(catalog);
-  const needleKeywords = [...new Set(keywords(effectiveNeedle))];
+  const queryKeywords = [...new Set(keywords(needle))];
+  const contextKeywords = [...new Set(keywords(contextNeedle))];
+  const needleKeywords = [...new Set([...queryKeywords, ...contextKeywords])];
   const candidateIds = new Set();
 
   needleKeywords.forEach((term) => {
@@ -737,14 +749,29 @@ export function searchCatalogOptions(query, catalog, limit = 20, context = '', k
     ? [...candidateIds].map((idx) => catalog[idx])
     : catalog.slice(0, 400);
 
-  const minScore = needleKeywords.length <= 2 ? 0.08 : 0.12;
+  const hasShortTechnicalQuery = queryKeywords.length > 0 && queryKeywords.length <= 2;
+  const minScore = hasShortTechnicalQuery ? 0.08 : 0.12;
 
   return candidates
-    .map((product) => ({
-      product,
-      score: similarity(effectiveNeedle, product.searchText || product.description),
-      source: product.source === 'batiprix' ? 'batiprix' : 'catalog',
-    }))
+    .map((product) => {
+      const haystack = product.searchText || product.description;
+      const queryScore = needle ? similarity(needle, haystack) : 0;
+      const contextScore = contextNeedle ? similarity(contextNeedle, haystack) : 0;
+      const combinedScore = similarity(effectiveNeedle, haystack);
+
+      let score = combinedScore;
+      if (hasShortTechnicalQuery) {
+        score = Math.max(queryScore, combinedScore * 0.92, contextScore * 0.55);
+      } else if (needle && contextNeedle) {
+        score = Math.max(combinedScore, queryScore * 0.82, contextScore * 0.45);
+      }
+
+      return {
+        product,
+        score,
+        source: product.source === 'batiprix' ? 'batiprix' : 'catalog',
+      };
+    })
     .filter((entry) => entry.score >= minScore)
     .sort((a, b) => {
       if (b.score !== a.score) return b.score - a.score;
@@ -753,68 +780,66 @@ export function searchCatalogOptions(query, catalog, limit = 20, context = '', k
     .slice(0, limit);
 }
 
-// For each DPGF line find the best supplier match and the best Batiprix fallback.
+function toUnifiedMatch(entry, matchType = 'suggestion') {
+  if (!entry) return null;
+  return {
+    product: entry.product,
+    score: entry.score,
+    source: entry.source === 'batiprix' ? 'batiprix' : 'catalog',
+    matchType,
+  };
+}
+
+// For each DPGF line find the best overall suggestion, a useful alternative, and a manual fallback.
 export function matchCatalogToLines(dpgfLines, catalog) {
   if (!catalog.length) return [];
   const fullKeywordIndex = getCatalogKeywordIndex(catalog);
-  const supplierCatalog = catalog.filter((product) => product.source !== 'batiprix');
-  const batiprixCatalog = catalog.filter((product) => product.source === 'batiprix');
-  const supplierKeywordIndex = getCatalogKeywordIndex(supplierCatalog);
-  const batiprixKeywordIndex = getCatalogKeywordIndex(batiprixCatalog);
 
   return dpgfLines
     .filter(l => !l.isSection)
     .map(l => {
       const lineText = l.matchText || l.description;
-      const { best: supplierBest, bestScore: supplierScore } = pickBestMatch(lineText, supplierCatalog, supplierKeywordIndex);
-      const { best: batiprixBest, bestScore: batiprixScore } = pickBestMatch(lineText, batiprixCatalog, batiprixKeywordIndex);
-      const manualSuggestion = searchCatalogOptions(l.description || lineText, catalog, 6, lineText, fullKeywordIndex)
-        .find((entry) => entry.product.id !== supplierBest?.id && entry.product.id !== batiprixBest?.id) || null;
-
-      const supplierMatch = supplierBest && supplierScore >= 0.35
-        ? {
-            product: supplierBest,
-            score: supplierScore,
-            matchType: 'catalog',
-          }
+      const suggestions = searchCatalogOptions(l.description || lineText, catalog, 10, lineText, fullKeywordIndex);
+      const primaryMatch = suggestions[0] && suggestions[0].score >= 0.2
+        ? toUnifiedMatch(suggestions[0], 'primary')
         : null;
 
-      const batiprixMatch = batiprixBest && batiprixScore >= 0.2
-        ? {
-            product: batiprixBest,
-            score: batiprixScore,
-            matchType: 'batiprix-fallback',
-            supplierScore,
-          }
+      const secondaryEntry = primaryMatch
+        ? suggestions.find((entry) =>
+            entry.product.id !== primaryMatch.product.id &&
+            (entry.source !== primaryMatch.source || entry.score >= Math.max(0.24, primaryMatch.score - 0.12))
+          )
+        : suggestions[0] || null;
+      const secondaryMatch = secondaryEntry && secondaryEntry.score >= 0.18
+        ? toUnifiedMatch(secondaryEntry, 'secondary')
         : null;
 
-      const manualMatch = manualSuggestion && manualSuggestion.score >= 0.2
-        ? {
-            product: manualSuggestion.product,
-            score: manualSuggestion.score,
-            source: manualSuggestion.source,
-            matchType: 'manual-suggestion',
-          }
+      const manualSuggestion = suggestions.find((entry) =>
+        entry.product.id !== primaryMatch?.product.id &&
+        entry.product.id !== secondaryMatch?.product.id
+      ) || null;
+      const manualMatch = manualSuggestion && manualSuggestion.score >= 0.18
+        ? toUnifiedMatch(manualSuggestion, 'manual-suggestion')
         : null;
 
       const rankedChoices = [
-        supplierMatch ? { key: 'catalog', score: supplierMatch.score } : null,
-        batiprixMatch ? { key: 'batiprix', score: batiprixMatch.score } : null,
+        primaryMatch ? { key: 'primary', score: primaryMatch.score } : null,
+        secondaryMatch ? { key: 'secondary', score: secondaryMatch.score } : null,
         manualMatch ? { key: 'manual', score: manualMatch.score } : null,
       ].filter(Boolean).sort((a, b) => b.score - a.score);
 
       const defaultChoice = rankedChoices[0]?.key || null;
 
-      if (!supplierMatch && !batiprixMatch && !manualMatch) return null;
+      if (!primaryMatch && !secondaryMatch && !manualMatch) return null;
 
       return {
         lineId: l.id,
         line: l,
-        supplierMatch,
-        batiprixMatch,
+        primaryMatch,
+        secondaryMatch,
         manualMatch,
         defaultChoice,
-        bestScore: Math.max(supplierMatch?.score || 0, batiprixMatch?.score || 0, manualMatch?.score || 0),
+        bestScore: Math.max(primaryMatch?.score || 0, secondaryMatch?.score || 0, manualMatch?.score || 0),
       };
     })
     .filter(Boolean)

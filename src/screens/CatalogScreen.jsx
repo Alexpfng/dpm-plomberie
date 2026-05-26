@@ -47,29 +47,44 @@ export default function CatalogScreen() {
 
   // Charge depuis Supabase au montage, met à jour le cache local
   useEffect(() => {
+    // cancelled évite les mises à jour d'état après démontage
+    // (React StrictMode déclenche les effets deux fois en développement)
+    let cancelled = false;
+
+    // Affichage immédiat du cache local, sans startTransition
+    // (les produits fantômes vides sont filtrés par loadLocal)
     const cachedProducts = loadCatalog();
     if (cachedProducts.length) {
-      startTransition(() => setProducts(cachedProducts));
+      setProducts(cachedProducts);
       setLoadingCatalog(false);
     }
 
+    // Chargement Supabase — mise à jour directe (sans startTransition)
+    // pour éviter que setLoadingCatalog(false) s'exécute avant setProducts
     loadCatalogFromDB((progressProducts) => {
-      startTransition(() => setProducts(progressProducts));
+      if (cancelled) return;
+      setProducts(progressProducts);
       setLoadError('');
       setLoadingCatalog(false);
     })
       .then((loadedProducts) => {
-        startTransition(() => setProducts(loadedProducts));
+        if (cancelled) return;
+        setProducts(loadedProducts);
         setLoadError('');
         setLoadingCatalog(false);
       })
       .catch((err) => {
+        if (cancelled) return;
         const message = err?.message || 'Chargement du catalogue impossible.';
         setLoadError(message);
         showToast(message, 'error');
         setLoadingCatalog(false);
       })
-      .finally(() => {});
+      .finally(() => {
+        if (!cancelled) setLoadingCatalog(false);
+      });
+
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
