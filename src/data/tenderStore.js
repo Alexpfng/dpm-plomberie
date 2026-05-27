@@ -335,6 +335,18 @@ function compactTenderLineForStorage(line) {
   return compactLine;
 }
 
+// Statuts du cycle de vie d'un appel d'offres
+export const TENDER_STATUSES = [
+  { id: 'in_progress', label: 'En cours',              color: '#2b6bff', bg: '#eaf1ff' },
+  { id: 'pending',     label: 'En attente de réponse', color: '#b76e00', bg: '#fff4e0' },
+  { id: 'won',         label: 'Validée',               color: '#0a7d44', bg: '#e0f6ea' },
+  { id: 'lost',        label: 'Perdue',                color: '#c93838', bg: '#fde4e4' },
+];
+
+export function getStatusMeta(statusId) {
+  return TENDER_STATUSES.find((s) => s.id === statusId) || TENDER_STATUSES[0];
+}
+
 export function saveTender(data) {
   const id = data.id || String(Date.now());
   const normalized = {
@@ -346,21 +358,34 @@ export function saveTender(data) {
   localStorage.setItem(DATA_PREFIX + id, JSON.stringify(normalized));
   localStorage.setItem(CURRENT_KEY, id);
 
+  // Préserve le statut existant lors d'un re-save (édition), nouveau dossier = 'in_progress'
+  const list = loadTenderHistory();
+  const existing = list.find((h) => h.id === id);
+
   const meta = {
     id,
     projectName: data.projectName || 'Sans nom',
     dpgfFileName: data.dpgfFileName || '',
     savedAt: Date.now(),
+    status: data.status || existing?.status || 'in_progress',
     lineCount: (data.lines || []).filter(l => !l.isSection).length,
     totalHT: (data.lines || []).filter(l => !l.isSection)
       .reduce((s, l) => s + (l.quantite || 0) * (l.prixUnitaire || 0), 0),
   };
-  const list = loadTenderHistory();
   const idx = list.findIndex(h => h.id === id);
   if (idx >= 0) list[idx] = meta; else list.unshift(meta);
   localStorage.setItem(HISTORY_KEY, JSON.stringify(list.slice(0, 30)));
 
   return normalized;
+}
+
+export function updateTenderStatus(id, status) {
+  if (!TENDER_STATUSES.some((s) => s.id === status)) return;
+  const list = loadTenderHistory();
+  const idx = list.findIndex((h) => h.id === id);
+  if (idx < 0) return;
+  list[idx] = { ...list[idx], status };
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
 }
 
 export function loadTender() {

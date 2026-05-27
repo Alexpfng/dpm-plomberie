@@ -178,7 +178,7 @@ export function TenderImportScreen() {
           crumbs={["Appels d'offres", "Nouveau dossier"]}
           right={
             <>
-              <button className="btn" onClick={() => nav('/dashboard')}>Annuler</button>
+              <button className="btn" onClick={() => nav('/exec')}>Annuler</button>
               <button className="btn brand" onClick={handleLaunch} disabled={parsing} style={{ opacity: parsing ? 0.7 : 1 }}>
                 {parsing ? '⏳ Analyse en cours…' : <>{Icons.bolt} Analyser les fichiers</>}
               </button>
