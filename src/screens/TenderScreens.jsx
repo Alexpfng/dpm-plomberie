@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { Sidebar, Topbar, useToast } from '../components/Shared';
 import { Icons } from '../components/Icons';
 import { parseDPGF, exportDPGF, saveTender, loadTender, loadTenderHistory, loadTenderById, setCurrentTender, deleteTenderFromHistory, parseCCTPText, parseCCTPSections, findQtyInCCTP } from '../data/tenderStore';
-import { loadCatalog, loadCatalogFromDB, matchCatalogToLines, searchCatalogOptions, catalogHasMatchFields } from '../data/catalogStore';
+import { loadCatalog, loadCatalogFromDB, matchCatalogToLinesProgressively, searchCatalogOptions, catalogHasMatchFields } from '../data/catalogStore';
 
 const fmt = (n) =>
   (typeof n === 'number' ? n : parseFloat(n) || 0)
@@ -339,7 +339,10 @@ export function TenderMatchScreen() {
   const [selectedMatchChoice, setSelectedMatchChoice] = useState({});
   const [manualMatchSelections, setManualMatchSelections] = useState({});
   const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogMatching, setCatalogMatching] = useState(false);
+  const [matchProgress, setMatchProgress] = useState({ done: 0, total: 0 });
   const [manualCatalogPicker, setManualCatalogPicker] = useState(null);
+  const catalogLoadPromiseRef = useRef(null);
 
   // ── CCTP spec popover ─────────────────────────────────────────────────────
   const [specPopover, setSpecPopover] = useState(null);
@@ -357,12 +360,16 @@ export function TenderMatchScreen() {
     // Si le catalogue est en mémoire avec les champs de matching (description_cctp, search_text), pas besoin de recharger
     if (cachedCatalog.length && catalogHasMatchFields()) return cachedCatalog;
 
+    if (catalogLoadPromiseRef.current) return catalogLoadPromiseRef.current;
+
     setCatalogLoading(true);
-    try {
-      return await loadCatalogFromDB(null, { matchFields: true });
-    } finally {
-      setCatalogLoading(false);
-    }
+    catalogLoadPromiseRef.current = loadCatalogFromDB(null, { matchFields: true })
+      .finally(() => {
+        catalogLoadPromiseRef.current = null;
+        setCatalogLoading(false);
+      });
+
+    return catalogLoadPromiseRef.current;
   }, []);
 
   useEffect(() => {
@@ -431,27 +438,54 @@ export function TenderMatchScreen() {
   };
 
   const openCatalogModal = async () => {
-    const catalog = await ensureCatalogReady();
+    // Ouvre la modal immédiatement avec un état de chargement pour donner du feedback
+    setCatalogMatches([]);
+    setMatchProgress({ done: 0, total: 0 });
+    setCatalogMatching(true);
+    setShowCatalogModal(true);
+
+    let catalog;
+    try {
+      catalog = await ensureCatalogReady();
+    } catch {
+      setCatalogMatching(false);
+      setShowCatalogModal(false);
+      showToast('Chargement de la base produits impossible pour le moment', 'error');
+      return;
+    }
+
     if (!catalog.length) {
+      setCatalogMatching(false);
+      setShowCatalogModal(false);
       showToast('Base produits vide — importez votre catalogue d\'abord', 'info');
       return;
     }
-    const matches = matchCatalogToLines(lines, catalog);
+
+    // Laisse React peindre l'état « Analyse… » avant de lancer le matching synchrone
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const matches = await matchCatalogToLinesProgressively(lines, catalog, (progress) => {
+      setMatchProgress(progress);
+    });
+
     if (!matches.length) {
+      setCatalogMatching(false);
+      setShowCatalogModal(false);
       showToast('Aucune correspondance trouvée dans la base produits', 'info');
       return;
     }
-    setCatalogMatches(matches);
+
     const defaults = {};
     const manualDefaults = {};
     matches.forEach((m) => {
       defaults[m.lineId] = m.defaultChoice;
       if (m.manualMatch) manualDefaults[m.lineId] = m.manualMatch;
     });
+    setCatalogMatches(matches);
     setSelectedMatchChoice(defaults);
     setManualMatchSelections(manualDefaults);
     setCoeffOverrides({});
-    setShowCatalogModal(true);
+    setCatalogMatching(false);
   };
 
   const applyCatalogMatches = () => {
@@ -466,9 +500,9 @@ export function TenderMatchScreen() {
         if (!choice) return l;
         const selectedMatch = choice === 'manual'
           ? manualMatchSelections[l.id]
-          : choice === 'secondary'
-            ? match.secondaryMatch
-            : match.primaryMatch;
+          : choice === 'batiprix'
+            ? match.batiprixMatch
+            : match.supplierMatch;
         if (!selectedMatch) return l;
         const c = parseFloat((coeffOverrides[l.id] ?? '').replace(',', '.')) || gc;
         const pu = parseFloat((selectedMatch.product.prixAchat * c).toFixed(2));
@@ -972,14 +1006,23 @@ export function TenderMatchScreen() {
                 <button className="btn ghost" onClick={() => setShowCatalogModal(false)} style={{ fontSize: 18, padding: '4px 10px' }}>×</button>
               </div>
 
+              {catalogMatching && (
+                <div style={{ padding: '28px 24px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--ink-4)', fontSize: 14, borderBottom: '1px solid var(--line)' }}>
+                  {matchProgress.total > 0
+                    ? `Analyse des correspondances base produits… ${matchProgress.done}/${matchProgress.total} lignes`
+                    : 'Chargement de la base produits…'}
+                </div>
+              )}
+
               {/* Table */}
+              {!catalogMatching && (
               <div style={{ overflowY: 'auto', flex: 1 }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                   <thead>
                     <tr style={{ background: 'var(--bg-soft)', position: 'sticky', top: 0, zIndex: 5 }}>
                       <th style={{ padding: '9px 12px', textAlign: 'left', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Désignation DPGF</th>
-                      <th style={{ padding: '9px 12px', textAlign: 'left', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Suggestion principale</th>
-                      <th style={{ padding: '9px 12px', textAlign: 'left', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Alternative</th>
+                      <th style={{ padding: '9px 12px', textAlign: 'left', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Base produits</th>
+                      <th style={{ padding: '9px 12px', textAlign: 'left', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Batiprix secours</th>
                       <th style={{ padding: '9px 12px', textAlign: 'left', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Choix manuel</th>
                       <th style={{ padding: '9px 12px', textAlign: 'right', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>PA HT</th>
                       <th style={{ padding: '9px 12px', textAlign: 'center', fontSize: 11, color: 'var(--ink-4)', fontWeight: 600 }}>Coeff.</th>
@@ -994,13 +1037,13 @@ export function TenderMatchScreen() {
                       const manual = manualMatchSelections[m.lineId] || m.manualMatch;
                       const selectedMatch = choice === 'manual'
                         ? manual
-                        : choice === 'secondary'
-                          ? m.secondaryMatch
-                          : m.primaryMatch;
+                        : choice === 'batiprix'
+                          ? m.batiprixMatch
+                          : m.supplierMatch;
                       const puPropose = selectedMatch ? parseFloat((selectedMatch.product.prixAchat * c).toFixed(2)) : 0;
-                      const primary = m.primaryMatch;
-                      const secondary = m.secondaryMatch;
-                      const primaryScoreColor = (primary?.score || 0) >= 0.6 ? 'var(--green-700)' : (primary?.score || 0) >= 0.35 ? 'var(--brand-700)' : 'var(--ink-4)';
+                      const supplier = m.supplierMatch;
+                      const batiprix = m.batiprixMatch;
+                      const supplierScoreColor = (supplier?.score || 0) >= 0.6 ? 'var(--green-700)' : (supplier?.score || 0) >= 0.35 ? 'var(--brand-700)' : 'var(--ink-4)';
                       return (
                         <tr key={m.lineId} style={{ opacity: choice ? 1 : 0.6, borderBottom: '1px solid var(--line-soft)', background: choice ? '' : 'var(--bg-soft)' }}>
                           <td style={{ padding: '10px 12px' }}>
@@ -1008,59 +1051,62 @@ export function TenderMatchScreen() {
                             <div className="tiny muted">{m.line.num} · {m.line.unite}</div>
                           </td>
                           <td style={{ padding: '10px 12px' }}>
-                            {primary ? (
-                              <>
-                                <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
-                                  <input
-                                    type="radio"
-                                    name={`match-${m.lineId}`}
-                                    checked={choice === 'primary'}
-                                    onChange={() => setSelectedMatchChoice((p) => ({ ...p, [m.lineId]: 'primary' }))}
-                                  />
-                                  <div>
-                                    <div className="tiny muted" style={{ marginBottom: 3 }}>
-                                      {primary.source === 'batiprix' ? 'Référence Batiprix' : 'Produit catalogue'}
-                                    </div>
-                                    <div style={{ fontSize: 13 }}>{primary.product.description.substring(0, 46)}{primary.product.description.length > 46 ? '…' : ''}</div>
-                                    <div className="tiny" style={{ color: 'var(--ink-4)' }}>
-                                      {primary.product.ref && <span style={{ fontFamily: 'var(--font-mono)' }}>{primary.product.ref} · </span>}
-                                      {primary.product.fournisseur}
-                                    </div>
-                                    <span style={{ marginTop: 4, display: 'inline-block', fontSize: 11, fontWeight: 700, color: primary.source === 'batiprix' ? 'var(--violet-700)' : primaryScoreColor, background: primary.source === 'batiprix' ? '#ede9fe' : primaryScoreColor + '18', padding: '2px 7px', borderRadius: 20 }}>
-                                      {primary.source === 'batiprix' ? 'Batiprix ' : ''}{Math.round(primary.score * 100)}%
-                                    </span>
-                                  </div>
-                                </label>
-                              </>
-                            ) : (
-                              <div className="tiny muted">Aucune suggestion fiable</div>
-                            )}
-                          </td>
-                          <td style={{ padding: '10px 12px' }}>
-                            {secondary ? (
+                            {supplier ? (
                               <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
                                 <input
                                   type="radio"
                                   name={`match-${m.lineId}`}
-                                  checked={choice === 'secondary'}
-                                  onChange={() => setSelectedMatchChoice((p) => ({ ...p, [m.lineId]: 'secondary' }))}
+                                  checked={choice === 'catalog'}
+                                  onChange={() => setSelectedMatchChoice((p) => ({ ...p, [m.lineId]: 'catalog' }))}
                                 />
                                 <div>
                                   <div className="tiny muted" style={{ marginBottom: 3 }}>
-                                    {secondary.source === 'batiprix' ? 'Alternative Batiprix' : 'Alternative catalogue'}
+                                    Produit catalogue
                                   </div>
-                                  <div style={{ fontSize: 13 }}>{secondary.product.description.substring(0, 46)}{secondary.product.description.length > 46 ? '…' : ''}</div>
+                                  <div style={{ fontSize: 13 }}>{supplier.product.description.substring(0, 46)}{supplier.product.description.length > 46 ? '…' : ''}</div>
                                   <div className="tiny" style={{ color: 'var(--ink-4)' }}>
-                                    {secondary.product.ref && <span style={{ fontFamily: 'var(--font-mono)' }}>{secondary.product.ref} · </span>}
-                                    {secondary.product.fournisseur}
+                                    {supplier.product.ref && <span style={{ fontFamily: 'var(--font-mono)' }}>{supplier.product.ref} · </span>}
+                                    {supplier.product.fournisseur}
                                   </div>
-                                  <span style={{ marginTop: 4, display: 'inline-block', fontSize: 11, fontWeight: 700, color: secondary.source === 'batiprix' ? 'var(--violet-700)' : 'var(--brand-700)', background: secondary.source === 'batiprix' ? '#ede9fe' : 'var(--brand-50)', padding: '2px 7px', borderRadius: 20 }}>
-                                    {secondary.source === 'batiprix' ? 'Batiprix ' : 'Catalogue '}{Math.round(secondary.score * 100)}%
+                                  <span style={{ marginTop: 4, display: 'inline-block', fontSize: 11, fontWeight: 700, color: supplierScoreColor, background: supplierScoreColor + '18', padding: '2px 7px', borderRadius: 20 }}>
+                                    {Math.round(supplier.score * 100)}%
                                   </span>
                                 </div>
                               </label>
                             ) : (
-                              <div className="tiny muted">Pas d’alternative utile</div>
+                              <div className="tiny muted">Aucune base produit fiable</div>
+                            )}
+                          </td>
+                          <td style={{ padding: '10px 12px' }}>
+                            {batiprix ? (
+                              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+                                <input
+                                  type="radio"
+                                  name={`match-${m.lineId}`}
+                                  checked={choice === 'batiprix'}
+                                  onChange={() => setSelectedMatchChoice((p) => ({ ...p, [m.lineId]: 'batiprix' }))}
+                                />
+                                <div>
+                                  <div className="tiny muted" style={{ marginBottom: 3 }}>
+                                    Réf. Batiprix de secours
+                                    {Number.isFinite(batiprix.supplierScore) && (
+                                      <span style={{ marginLeft: 8 }}>
+                                        base produit {supplier ? Math.round((batiprix.supplierScore || 0) * 100) : 0}%
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div style={{ fontSize: 13 }}>{batiprix.product.description.substring(0, 46)}{batiprix.product.description.length > 46 ? '…' : ''}</div>
+                                  <div className="tiny" style={{ color: 'var(--ink-4)' }}>
+                                    {batiprix.product.ref && <span style={{ fontFamily: 'var(--font-mono)' }}>{batiprix.product.ref} · </span>}
+                                    {batiprix.product.fournisseur}
+                                  </div>
+                                  <span style={{ marginTop: 4, display: 'inline-block', fontSize: 11, fontWeight: 700, color: 'var(--violet-700)', background: '#ede9fe', padding: '2px 7px', borderRadius: 20 }}>
+                                    Batiprix {Math.round(batiprix.score * 100)}%
+                                  </span>
+                                </div>
+                              </label>
+                            ) : (
+                              <div className="tiny muted">Pas de secours Batiprix</div>
                             )}
                           </td>
                           <td style={{ padding: '10px 12px' }}>
@@ -1073,7 +1119,7 @@ export function TenderMatchScreen() {
                                   onChange={() => setSelectedMatchChoice((p) => ({ ...p, [m.lineId]: 'manual' }))}
                                 />
                                 <div>
-                                  <div className="tiny muted" style={{ marginBottom: 3 }}>Suggestion manuelle</div>
+                                  <div className="tiny muted" style={{ marginBottom: 3 }}>Recherche manuelle</div>
                                   <div style={{ fontSize: 13 }}>{manual.product.description.substring(0, 46)}{manual.product.description.length > 46 ? '…' : ''}</div>
                                   <div className="tiny" style={{ color: 'var(--ink-4)' }}>
                                     {manual.product.ref && <span style={{ fontFamily: 'var(--font-mono)' }}>{manual.product.ref} · </span>}
@@ -1127,6 +1173,7 @@ export function TenderMatchScreen() {
                   </tbody>
                 </table>
               </div>
+              )}
 
               {/* Footer */}
               <div style={{ padding: '14px 24px', borderTop: '1px solid var(--line)', display: 'flex', gap: 10, justifyContent: 'space-between', alignItems: 'center' }}>

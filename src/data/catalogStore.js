@@ -43,21 +43,24 @@ function isRealProduct(p) {
 function saveLocal(products) {
   // Ne pas persister les lignes fantômes créées par addRow mais jamais validées
   const toSave = products.filter(isRealProduct);
+  // Catalogue trop volumineux pour localStorage → on n'écrit rien plutôt que de tronquer
+  // (un cache partiel fausserait le matching DPGF la session suivante)
   if (toSave.length > MAX_LOCAL_CACHE_PRODUCTS) {
-    try { localStorage.removeItem(KEY); } catch { /* trop grand pour le cache local */ }
+    try { localStorage.removeItem(KEY); } catch { /* localStorage indisponible */ }
     return;
   }
   try {
     localStorage.setItem(KEY, JSON.stringify(toSave));
   } catch {
-    try { localStorage.removeItem(KEY); } catch {}
+    try { localStorage.removeItem(KEY); } catch { /* localStorage indisponible */ }
   }
 }
 
 function loadLocal() {
   try {
-    const data = JSON.parse(localStorage.getItem(KEY) || '[]');
-    // Filtre les produits fantômes déjà enregistrés dans des sessions précédentes
+    const raw = JSON.parse(localStorage.getItem(KEY) || '[]');
+    // Rétro-compat : ancien format = tableau direct, ou objet { products: [...] } d'une version intermédiaire
+    const data = Array.isArray(raw) ? raw : (Array.isArray(raw?.products) ? raw.products : []);
     return data.filter(isRealProduct);
   } catch { return []; }
 }
@@ -119,7 +122,8 @@ export async function loadCatalogFromDB(onProgress, { matchFields = true } = {})
   const { data: firstPage, error: firstError } = await supabase
     .from(TABLE)
     .select(fields)
-    .order('created_at', { ascending: true })
+    // Tri sur la clé primaire (indexée) plutôt que created_at (potentiellement non indexé)
+    .order('id', { ascending: true })
     .range(0, PAGE - 1);
 
   if (firstError) {
@@ -139,7 +143,7 @@ export async function loadCatalogFromDB(onProgress, { matchFields = true } = {})
       const { data, error } = await supabase
         .from(TABLE)
         .select(fields)
-        .order('created_at', { ascending: true })
+        .order('id', { ascending: true })
         .range(from, from + PAGE - 1);
 
       if (error) {
@@ -707,38 +711,6 @@ function similarity(a, b) {
   return Math.min(1, score);
 }
 
-function pickBestMatch(lineDescription, catalog, keywordIndex) {
-  if (!catalog.length) return { best: null, bestScore: 0 };
-
-  const lineKeywords = [...new Set(keywords(lineDescription))];
-  const candidateIds = new Set();
-
-  lineKeywords.forEach((term) => {
-    const matches = keywordIndex.get(term);
-    if (!matches) return;
-    for (const idx of matches) {
-      candidateIds.add(idx);
-      if (candidateIds.size >= 250) break;
-    }
-  });
-
-  const candidates = candidateIds.size
-    ? [...candidateIds].map((idx) => catalog[idx])
-    : catalog.slice(0, 250);
-
-  let best = null;
-  let bestScore = 0;
-  for (const product of candidates) {
-    const score = similarity(lineDescription, product.searchText || product.description);
-    if (score > bestScore) {
-      bestScore = score;
-      best = product;
-    }
-  }
-
-  return { best, bestScore };
-}
-
 export function searchCatalogOptions(query, catalog, limit = 20, context = '', keywordIndex = null) {
   const needle = String(query || '').trim();
   const contextNeedle = String(context || '').trim();
@@ -795,68 +767,221 @@ export function searchCatalogOptions(query, catalog, limit = 20, context = '', k
     .slice(0, limit);
 }
 
-function toUnifiedMatch(entry, matchType = 'suggestion') {
-  if (!entry) return null;
-  return {
-    product: entry.product,
-    score: entry.score,
-    source: entry.source === 'batiprix' ? 'batiprix' : 'catalog',
-    matchType,
+// Pré-calcule par produit : texte normalisé + carte pondérée des tokens.
+// Évite de recalculer normStr/keywords/weightedTokenMap pour chaque comparaison
+// (sur 20k+ produits × 600+ lignes, c'est la différence entre 3 minutes et 3 secondes).
+function buildProductMatchIndex(catalog) {
+  return catalog.map((product) => {
+    const text = product.searchText || product.description || '';
+    return {
+      product,
+      normalized: normStr(text),
+      tokenMap: weightedTokenMap(text),
+    };
+  });
+}
+
+// Index de mots-clés calculé à partir des données déjà normalisées
+function buildKeywordIndexFromMatchIndex(matchIndex) {
+  const buckets = new Map();
+  matchIndex.forEach((entry, idx) => {
+    const terms = [...new Set(entry.tokenMap.keys())];
+    terms.forEach((term) => {
+      if (!buckets.has(term)) buckets.set(term, []);
+      buckets.get(term).push(idx);
+    });
+  });
+  return buckets;
+}
+
+// Version rapide de similarity qui consomme directement les structures pré-calculées
+function similarityWithMaps(aNormalized, aTokenMap, bNormalized, bTokenMap) {
+  if (!aTokenMap.size || !bTokenMap.size) return 0;
+
+  let sharedQueryWeight = 0;
+  aTokenMap.forEach((weight, token) => {
+    if (bTokenMap.has(token)) sharedQueryWeight += weight;
+  });
+
+  let queryTotal = 0;
+  aTokenMap.forEach((value) => { queryTotal += value; });
+  let productTotal = 0;
+  bTokenMap.forEach((value) => { productTotal += value; });
+
+  let score = (sharedQueryWeight / queryTotal) * 0.78 + (sharedQueryWeight / productTotal) * 0.22;
+
+  const phraseA = aNormalized.split(' ').filter(Boolean);
+  const phraseB = bNormalized.split(' ').filter(Boolean);
+  let exactSequence = 0;
+  for (let i = 0; i < phraseA.length; i++) {
+    if (phraseA[i] === phraseB[i]) exactSequence++;
+  }
+  if (phraseA.length > 1) score += Math.min(0.12, exactSequence / phraseA.length * 0.12);
+
+  const bTokenSet = new Set(phraseB);
+  aTokenMap.forEach((weight, token) => {
+    if (bTokenSet.has(token)) score += Math.min(0.05, weight * 0.01);
+  });
+
+  TERM_ALIASES.forEach((aliases, canonical) => {
+    const aHas = aliases.some((term) => aNormalized.includes(term)) || aNormalized.includes(canonical);
+    const bHas = aliases.some((term) => bNormalized.includes(term)) || bNormalized.includes(canonical);
+    if (aHas && bHas) score += 0.08;
+  });
+
+  if (aNormalized.includes('lavabo') && bNormalized.includes('lavabo')) score += 0.08;
+  if (aNormalized.includes('robinet') && bNormalized.includes('robinet')) score += 0.08;
+  if (aNormalized.includes('wc') && bNormalized.includes('wc')) score += 0.08;
+  if (aNormalized.includes('pmr') && bNormalized.includes('pmr')) score += 0.05;
+
+  return Math.min(1, score);
+}
+
+// Renvoie les top N matchs (avec score) à partir d'un index pré-calculé
+function pickTopFromMatchIndex(lineNormalized, lineTokenMap, lineKeywords, matchIndex, keywordIndex, limit = 3) {
+  if (!matchIndex.length) return [];
+
+  const candidateIds = new Set();
+  lineKeywords.forEach((term) => {
+    const matches = keywordIndex.get(term);
+    if (!matches) return;
+    for (const idx of matches) {
+      candidateIds.add(idx);
+      if (candidateIds.size >= 250) break;
+    }
+  });
+
+  const candidates = candidateIds.size
+    ? [...candidateIds]
+    : Array.from({ length: Math.min(250, matchIndex.length) }, (_, i) => i);
+
+  const scored = [];
+  for (const idx of candidates) {
+    const entry = matchIndex[idx];
+    const score = similarityWithMaps(lineNormalized, lineTokenMap, entry.normalized, entry.tokenMap);
+    if (score > 0) scored.push({ product: entry.product, score });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit);
+}
+
+function buildCatalogLineMatcher(catalog) {
+  const supplierCatalog = catalog.filter((product) => product.source !== 'batiprix');
+  const batiprixCatalog = catalog.filter((product) => product.source === 'batiprix');
+  const supplierMatchIndex = buildProductMatchIndex(supplierCatalog);
+  const batiprixMatchIndex = buildProductMatchIndex(batiprixCatalog);
+  const supplierKeywordIndex = buildKeywordIndexFromMatchIndex(supplierMatchIndex);
+  const batiprixKeywordIndex = buildKeywordIndexFromMatchIndex(batiprixMatchIndex);
+
+  return (line) => {
+    const lineText = line.matchText || line.description || '';
+    const lineNormalized = normStr(lineText);
+    const lineTokenMap = weightedTokenMap(lineText);
+    const lineKeywords = [...new Set(lineTokenMap.keys())];
+
+    const supplierTop = pickTopFromMatchIndex(lineNormalized, lineTokenMap, lineKeywords, supplierMatchIndex, supplierKeywordIndex, 3);
+    const batiprixTop = pickTopFromMatchIndex(lineNormalized, lineTokenMap, lineKeywords, batiprixMatchIndex, batiprixKeywordIndex, 3);
+
+    const supplierBest = supplierTop[0];
+    const batiprixBest = batiprixTop[0];
+
+    const supplierMatch = supplierBest && supplierBest.score >= 0.35
+      ? {
+          product: supplierBest.product,
+          score: supplierBest.score,
+          source: 'catalog',
+          matchType: 'catalog',
+        }
+      : null;
+
+    const batiprixMatch = batiprixBest && batiprixBest.score >= 0.2
+      ? {
+          product: batiprixBest.product,
+          score: batiprixBest.score,
+          source: 'batiprix',
+          matchType: 'batiprix-fallback',
+          supplierScore: supplierBest?.score || 0,
+        }
+      : null;
+
+    // Suggestion « Choix manuel » : 2e meilleur d'une des deux bases, en excluant
+    // les deux meilleurs déjà retenus. Évite l'appel coûteux à searchCatalogOptions
+    // qui tournait sur le catalogue complet (~1200 comparaisons par ligne).
+    const manualCandidates = [...supplierTop.slice(1), ...batiprixTop.slice(1)]
+      .filter((entry) =>
+        entry.product.id !== supplierBest?.product.id &&
+        entry.product.id !== batiprixBest?.product.id
+      )
+      .sort((a, b) => b.score - a.score);
+    const manualBest = manualCandidates[0];
+    const manualMatch = manualBest && manualBest.score >= 0.18
+      ? {
+          product: manualBest.product,
+          score: manualBest.score,
+          source: manualBest.product.source === 'batiprix' ? 'batiprix' : 'catalog',
+          matchType: 'manual-suggestion',
+        }
+      : null;
+
+    const rankedChoices = [
+      supplierMatch ? { key: 'catalog', score: supplierMatch.score } : null,
+      batiprixMatch ? { key: 'batiprix', score: batiprixMatch.score } : null,
+      manualMatch ? { key: 'manual', score: manualMatch.score } : null,
+    ].filter(Boolean).sort((a, b) => b.score - a.score);
+
+    const defaultChoice = rankedChoices[0]?.key || null;
+
+    if (!supplierMatch && !batiprixMatch && !manualMatch) return null;
+
+    return {
+      lineId: line.id,
+      line,
+      supplierMatch,
+      batiprixMatch,
+      manualMatch,
+      defaultChoice,
+      bestScore: Math.max(supplierMatch?.score || 0, batiprixMatch?.score || 0, manualMatch?.score || 0),
+    };
   };
 }
 
-// For each DPGF line find the best overall suggestion, a useful alternative, and a manual fallback.
+// For each DPGF line find the best supplier match and the best Batiprix fallback.
 export function matchCatalogToLines(dpgfLines, catalog) {
   if (!catalog.length) return [];
-  const fullKeywordIndex = getCatalogKeywordIndex(catalog);
+  const matchLine = buildCatalogLineMatcher(catalog);
 
   return dpgfLines
-    .filter(l => !l.isSection)
-    .map(l => {
-      const lineText = l.matchText || l.description;
-      const suggestions = searchCatalogOptions(l.description || lineText, catalog, 10, lineText, fullKeywordIndex);
-      const primaryMatch = suggestions[0] && suggestions[0].score >= 0.2
-        ? toUnifiedMatch(suggestions[0], 'primary')
-        : null;
-
-      const secondaryEntry = primaryMatch
-        ? suggestions.find((entry) =>
-            entry.product.id !== primaryMatch.product.id &&
-            (entry.source !== primaryMatch.source || entry.score >= Math.max(0.24, primaryMatch.score - 0.12))
-          )
-        : suggestions[0] || null;
-      const secondaryMatch = secondaryEntry && secondaryEntry.score >= 0.18
-        ? toUnifiedMatch(secondaryEntry, 'secondary')
-        : null;
-
-      const manualSuggestion = suggestions.find((entry) =>
-        entry.product.id !== primaryMatch?.product.id &&
-        entry.product.id !== secondaryMatch?.product.id
-      ) || null;
-      const manualMatch = manualSuggestion && manualSuggestion.score >= 0.18
-        ? toUnifiedMatch(manualSuggestion, 'manual-suggestion')
-        : null;
-
-      const rankedChoices = [
-        primaryMatch ? { key: 'primary', score: primaryMatch.score } : null,
-        secondaryMatch ? { key: 'secondary', score: secondaryMatch.score } : null,
-        manualMatch ? { key: 'manual', score: manualMatch.score } : null,
-      ].filter(Boolean).sort((a, b) => b.score - a.score);
-
-      const defaultChoice = rankedChoices[0]?.key || null;
-
-      if (!primaryMatch && !secondaryMatch && !manualMatch) return null;
-
-      return {
-        lineId: l.id,
-        line: l,
-        primaryMatch,
-        secondaryMatch,
-        manualMatch,
-        defaultChoice,
-        bestScore: Math.max(primaryMatch?.score || 0, secondaryMatch?.score || 0, manualMatch?.score || 0),
-      };
-    })
+    .filter((line) => !line.isSection)
+    .map(matchLine)
     .filter(Boolean)
     .sort((a, b) => b.bestScore - a.bestScore);
+}
+
+export async function matchCatalogToLinesProgressively(dpgfLines, catalog, onProgress, chunkSize = 24) {
+  if (!catalog.length) return [];
+  const matchLine = buildCatalogLineMatcher(catalog);
+  const workLines = dpgfLines.filter((line) => !line.isSection);
+  const results = [];
+
+  for (let index = 0; index < workLines.length; index += chunkSize) {
+    const chunk = workLines.slice(index, index + chunkSize);
+    chunk.forEach((line) => {
+      const match = matchLine(line);
+      if (match) results.push(match);
+    });
+
+    if (typeof onProgress === 'function') {
+      onProgress({
+        done: Math.min(index + chunk.length, workLines.length),
+        total: workLines.length,
+      });
+    }
+
+    if (index + chunkSize < workLines.length) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  return results.sort((a, b) => b.bestScore - a.bestScore);
 }
