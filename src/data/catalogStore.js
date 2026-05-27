@@ -866,6 +866,11 @@ function pickTopFromMatchIndex(lineNormalized, lineTokenMap, lineKeywords, match
   return scored.slice(0, limit);
 }
 
+// Score minimum pour qu'un match soit appliqué automatiquement (prix pré-rempli).
+// En dessous, le match est seulement proposé dans la modale ; la ligne reste à 0 €.
+// Les bons matchs observés tournent autour de 0,60 ; les coïncidences vers 0,35-0,50.
+const AUTO_APPLY_MIN_SCORE = 0.55;
+
 function buildCatalogLineMatcher(catalog) {
   const supplierCatalog = catalog.filter((product) => product.source !== 'batiprix');
   const batiprixCatalog = catalog.filter((product) => product.source === 'batiprix');
@@ -930,7 +935,12 @@ function buildCatalogLineMatcher(catalog) {
       manualMatch ? { key: 'manual', score: manualMatch.score } : null,
     ].filter(Boolean).sort((a, b) => b.score - a.score);
 
-    const defaultChoice = rankedChoices[0]?.key || null;
+    // N'auto-applique un prix QUE si le meilleur match est fiable (>= AUTO_APPLY_MIN_SCORE).
+    // Sinon defaultChoice = null : la ligne reste à 0 € (à compléter à la main) et le match
+    // reste visible dans la modale pour une sélection manuelle. Évite d'appliquer des prix
+    // aberrants quand une ligne vague matche un produit cher sans rapport (VMC, clim…).
+    const topChoice = rankedChoices[0];
+    const defaultChoice = topChoice && topChoice.score >= AUTO_APPLY_MIN_SCORE ? topChoice.key : null;
 
     if (!supplierMatch && !batiprixMatch && !manualMatch) return null;
 
