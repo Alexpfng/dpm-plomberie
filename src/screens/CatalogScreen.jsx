@@ -55,10 +55,9 @@ export default function CatalogScreen() {
       setLoadingCatalog(false);
     }
 
-    // Timeout de 20 s : Supabase free-tier peut mettre 30-60 s à se réveiller
+    // Supabase free-tier peut mettre 30-60 s à se réveiller : on avertit sans masquer l'écran.
     const timeoutId = setTimeout(() => {
       if (cancelled) return;
-      setLoadingCatalog(false);
       setLoadError('Le chargement Supabase prend trop de temps. Votre projet est peut-être en veille — attendez 30 secondes puis actualisez la page.');
     }, 20000);
 
@@ -318,9 +317,15 @@ export default function CatalogScreen() {
           </div>
         )}
 
-        {loadingCatalog && (
+        {loadingCatalog && products.length === 0 && (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 220, color: 'var(--ink-4)', fontSize: 14 }}>
             Chargement du catalogue distant…
+          </div>
+        )}
+
+        {loadingCatalog && products.length > 0 && (
+          <div style={{ margin: '12px 24px 0', padding: '10px 12px', borderRadius: 10, background: '#eef5ff', border: '1px solid #c6dafc', color: '#2457a6', fontSize: 13 }}>
+            Chargement du catalogue distant en cours… affichage progressif de la base locale.
           </div>
         )}
 
