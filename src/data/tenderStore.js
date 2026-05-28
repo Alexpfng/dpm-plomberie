@@ -5,9 +5,9 @@ const KEY = 'dpm_tender';
 // ─── CCTP PARSING ─────────────────────────────────────────────────────────────
 
 export async function parseCCTPText(file) {
-  const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist');
+  const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist/legacy/build/pdf.mjs');
   GlobalWorkerOptions.workerSrc = new URL(
-    'pdfjs-dist/build/pdf.worker.min.mjs',
+    'pdfjs-dist/legacy/build/pdf.worker.min.mjs',
     import.meta.url
   ).toString();
 
@@ -136,10 +136,10 @@ function extractKeywords(description) {
 function extractQty(text) {
   const candidates = [];
 
-  const push = (re, weight) => {
+  const push = (re, weight, isValid = () => true) => {
     for (const m of text.matchAll(new RegExp(re.source, re.flags + (re.flags.includes('g') ? '' : 'g')))) {
       const n = parseFloat(m[1].replace(',', '.'));
-      if (isFinite(n) && n > 0 && n <= 99999 && !String(n).includes('e')) {
+      if (isFinite(n) && n > 0 && n <= 99999 && !String(n).includes('e') && isValid(n, m)) {
         candidates.push({ n, weight });
       }
     }
@@ -149,8 +149,9 @@ function extractQty(text) {
   push(/\b(\d+(?:[.,]\d+)?)\s+(?:arbres?|arbustes?|plants?|potelets?|bennes?|panneaux?|tables?|bancs?|pergolas?|regards?|massifs?|bordures?|rampes?|escaliers?|plots?|assises?|jeux|colonnes?|robinets?|lavabos?|wcs?|cuvettes?|reservoirs?|pompes?|chauffe.eaux?|radiateurs?|grilles?|poteaux?|piquets?|grillages?)/i, 3);
   // High confidence: number + unit
   push(/\b(\d+(?:[.,]\d+)?)\s*(?:ml\b|m²|m2|m³|m3|ens\b|u\b(?!\w)|unites?|pieces?|kg\b|t\b(?!\w)|h\b(?!\w)|forfait)/i, 2);
-  // Medium: number at start of line before any word ≥4 letters
-  push(/^(\d+(?:[.,]\d+)?)\s+[a-zA-ZÀ-ÿ]{4}/mg, 1);
+  // Medium: number at start of line before any word ≥4 letters.
+  // We keep this only for "small" values to avoid capturing project/job numbers like 1714.
+  push(/^(\d+(?:[.,]\d+)?)\s+[a-zA-ZÀ-ÿ]{4}/mg, 1, (n) => n <= 500);
 
   if (!candidates.length) return null;
   // Return highest weight, then largest number (most specific)
@@ -376,16 +377,21 @@ const toNum = (v) => {
   return isNaN(n) ? null : n;
 };
 
-// Find the header row: the first row that has BOTH a qty keyword AND a price keyword
+// Find the header row in the first part of the workbook.
+// Some DPGFs have a long preamble and only expose the real table header much later.
 function findHeaderRow(rows) {
   const qtyKw   = ['qté', 'qte', 'qt.', 'quantité', 'quantite', 'nombre', 'nbre'];
   const priceKw = ['pu', 'p.u.', 'p.u', 'prix unitaire', 'prix unit', 'unitaire', 'montant', 'total ht', 'total h.t'];
+  const unitKw  = ['u', 'u.', 'unité', 'unite'];
+  const descKw  = ['description', 'désignation', 'designation', 'libellé', 'libelle', 'nature', 'ouvrage', 'travaux'];
 
-  for (let i = 0; i < Math.min(60, rows.length); i++) {
+  for (let i = 0; i < Math.min(250, rows.length); i++) {
     const cells = rows[i].map(c => String(c ?? '').toLowerCase().trim());
     const hasQty   = cells.some(c => qtyKw.some(k => c === k || c.startsWith(k)));
     const hasPrice = cells.some(c => priceKw.some(k => c === k || c.includes(k)));
-    if (hasQty && hasPrice) return i;
+    const hasUnit  = cells.some(c => unitKw.some(k => c === k || c.startsWith(k)));
+    const hasDesc  = cells.some(c => descKw.some(k => c === k || c.includes(k)));
+    if (hasDesc && ((hasQty && hasPrice) || (hasQty && hasUnit) || (hasPrice && hasUnit))) return i;
   }
   return -1;
 }
@@ -500,8 +506,10 @@ function parseSheet(rows) {
   const cols = mapColumns(rows[hi]);
   inferDescColumns(rows, hi, cols);
 
-  // At minimum we need a price or qty column
-  if (cols.prixUnitaire === -1 && cols.quantite === -1) return null;
+  // At minimum we need a description column and one structural clue
+  const hasDescriptionColumn = cols.desc0 >= 0 || cols.desc1 >= 0 || cols.desc2 >= 0;
+  const hasStructuredColumn = cols.unite >= 0 || cols.quantite >= 0 || cols.prixUnitaire >= 0 || cols.total >= 0;
+  if (!hasDescriptionColumn || !hasStructuredColumn) return null;
 
   const lines = [];
 
@@ -587,9 +595,9 @@ export function parseDPGF(file) {
         }
 
         reject(new Error(
-          'Structure non reconnue. Assurez-vous que le fichier contient des colonnes ' +
-          '"Qté" et "PU" (ou équivalents). ' +
-          'Formats testés : DPGF marchés publics français standard.'
+          'Structure non reconnue. Assurez-vous que le fichier contient au moins une colonne ' +
+          '"Description/Désignation" et des colonnes de structure comme "Unité", "Qté" ou "PU". ' +
+          'Les quantités pourront ensuite être enrichies via le CCTP si nécessaire.'
         ));
       } catch (err) {
         reject(new Error('Erreur de lecture : ' + err.message));

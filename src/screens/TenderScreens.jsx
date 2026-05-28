@@ -1,9 +1,9 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Sidebar, Topbar, useToast } from '../components/Shared';
 import { Icons } from '../components/Icons';
 import { parseDPGF, exportDPGF, saveTender, loadTender, loadTenderHistory, loadTenderById, setCurrentTender, deleteTenderFromHistory, parseCCTPText, parseCCTPSections, findQtyInCCTP } from '../data/tenderStore';
-import { loadCatalog, matchCatalogToLines } from '../data/catalogStore';
+import { loadCatalog, loadCatalogFromDB, matchCatalogToLines } from '../data/catalogStore';
 
 const fmt = (n) =>
   (typeof n === 'number' ? n : parseFloat(n) || 0)
@@ -104,17 +104,46 @@ export function TenderImportScreen() {
     setParsing(true);
     try {
       const result = await parseDPGF(dpgfFile);
+      let parsedLines = result.lines;
+
+      if (cctpFile) {
+        showToast('Lecture du CCTP en cours…', 'info');
+        const cctpText = await parseCCTPText(cctpFile);
+        parsedLines = result.lines.map((line) => {
+          if (line.isSection) return line;
+          const found = findQtyInCCTP(line, cctpText);
+          if (!found) return { ...line, cctpAnalyzed: true, cctpSpecs: [] };
+
+          const update = {
+            ...line,
+            cctpAnalyzed: true,
+            cctpContext: found.context,
+            cctpSpecs: found.specs ?? [],
+            cctpBlock: found.block ?? '',
+          };
+
+          if (found.qty !== null && (!line.quantite || line.quantite === 0)) {
+            update.quantite = found.qty;
+            update.qtySources = 'cctp';
+            update.qtyFromDesc = false;
+            update.totalHT = found.qty * (line.prixUnitaire ?? 0);
+          }
+
+          return update;
+        });
+      }
+
       const name = projectName.trim() || dpgfFile.name.replace(/\.[^.]+$/, '');
       saveTender({
-        lines: result.lines,
+        lines: parsedLines,
         projectName: name,
         dpgfFileName: dpgfFile.name,
         cctpFileName: cctpFile?.name ?? null,
         sheetName: result.sheetName,
-        totalRows: result.totalRows,
+        totalRows: parsedLines.length,
         parsedAt: Date.now(),
       });
-      showToast(`${result.lines.length} lignes importées avec succès`, 'success');
+      showToast(`${parsedLines.length} lignes importées avec succès`, 'success');
       setTimeout(() => nav('/tender/match'), 600);
     } catch (err) {
       setError(err.message);
@@ -308,6 +337,7 @@ export function TenderMatchScreen() {
   const [globalCoeff, setGlobalCoeff] = useState('1.40');
   const [coeffOverrides, setCoeffOverrides] = useState({});
   const [checkedMatches, setCheckedMatches] = useState({});
+  const [catalogLoading, setCatalogLoading] = useState(false);
 
   // ── CCTP spec popover ─────────────────────────────────────────────────────
   const [specPopover, setSpecPopover] = useState(null);
@@ -320,8 +350,24 @@ export function TenderMatchScreen() {
     setSpecPopover({ specs: line.cctpSpecs, context: line.cctpContext, block: line.cctpBlock, description: getLineDescription(line), top, left });
   };
 
-  const openCatalogModal = () => {
-    const catalog = loadCatalog();
+  const ensureCatalogReady = useCallback(async () => {
+    const cachedCatalog = loadCatalog();
+    if (cachedCatalog.length) return cachedCatalog;
+
+    setCatalogLoading(true);
+    try {
+      return await loadCatalogFromDB();
+    } finally {
+      setCatalogLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    ensureCatalogReady().catch(() => {});
+  }, [ensureCatalogReady]);
+
+  const openCatalogModal = async () => {
+    const catalog = await ensureCatalogReady();
     if (!catalog.length) {
       showToast('Base produits vide — importez votre catalogue d\'abord', 'info');
       return;
@@ -379,7 +425,7 @@ export function TenderMatchScreen() {
           // Always mark as analyzed so we can show status even when nothing found
           if (!found) return { ...l, cctpAnalyzed: true, cctpSpecs: [] };
           const update = { ...l, cctpAnalyzed: true, cctpContext: found.context, cctpSpecs: found.specs ?? [], cctpBlock: found.block ?? '' };
-          if (found.qty !== null) {
+          if (found.qty !== null && (!l.quantite || l.quantite === 0)) {
             update.quantite = found.qty;
             update.qtySources = 'cctp';
             update.qtyFromDesc = false;
@@ -570,8 +616,9 @@ export function TenderMatchScreen() {
             className="btn"
             style={{ background: 'linear-gradient(135deg,#dcfce7,#d1fae5)', color: 'var(--green-700)', border: '1px solid #86efac', gap: 6 }}
             onClick={openCatalogModal}
+            disabled={catalogLoading}
           >
-            {Icons.package} Base produits
+            {catalogLoading ? '⏳ Chargement base produits…' : <>{Icons.package} Base produits</>}
           </button>
 
           {/* CCTP analysis button */}
