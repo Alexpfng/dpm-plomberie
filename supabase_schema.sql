@@ -88,11 +88,23 @@ CREATE TABLE public.catalog_products (
   description text DEFAULT '' NOT NULL,
   unite text DEFAULT '' NOT NULL,
   prix_achat numeric(12,2) DEFAULT 0 NOT NULL,
+  prix_vente numeric(12,2) DEFAULT 0 NOT NULL,
   fournisseur text DEFAULT '' NOT NULL,
   famille text DEFAULT '' NOT NULL,
+  description_cctp text DEFAULT '' NOT NULL,
+  search_text text DEFAULT '' NOT NULL,
+  source text DEFAULT '' NOT NULL,
+  source_sheet text DEFAULT '' NOT NULL,
   created_at timestamptz DEFAULT now() NOT NULL,
   updated_at timestamptz DEFAULT now() NOT NULL
 );
+
+ALTER TABLE public.catalog_products ADD COLUMN IF NOT EXISTS prix_vente numeric(12,2) DEFAULT 0 NOT NULL;
+ALTER TABLE public.catalog_products ADD COLUMN IF NOT EXISTS description_cctp text DEFAULT '' NOT NULL;
+ALTER TABLE public.catalog_products ADD COLUMN IF NOT EXISTS search_text text DEFAULT '' NOT NULL;
+ALTER TABLE public.catalog_products ADD COLUMN IF NOT EXISTS source text DEFAULT '' NOT NULL;
+ALTER TABLE public.catalog_products ADD COLUMN IF NOT EXISTS source_sheet text DEFAULT '' NOT NULL;
+
 
 -- ── Profiles (avec crm_role) ──
 CREATE TABLE public.profiles (

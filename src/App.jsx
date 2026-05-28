@@ -1,7 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import ExecutiveDashboard from './screens/ExecutiveDashboard';
-import DashboardScreen from './screens/DashboardScreen';
-import QuoteScreen from './screens/QuoteScreen';
 import { TenderImportScreen, TenderMatchScreen, TenderFinalScreen } from './screens/TenderScreens';
 import CatalogScreen from './screens/CatalogScreen';
 import CrmApp from './crm/CrmApp';
@@ -27,9 +25,6 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Navigate to="/exec" replace />} />
         <Route path="/exec" element={<ExecutiveDashboard />} />
-        <Route path="/dashboard" element={<DashboardScreen />} />
-        <Route path="/quotes" element={<QuoteScreen />} />
-        <Route path="/quotes/new" element={<QuoteScreen />} />
         <Route path="/tender" element={<TenderImportScreen />} />
         <Route path="/tender/match" element={<TenderMatchScreen />} />
         <Route path="/tender/final" element={<TenderFinalScreen />} />

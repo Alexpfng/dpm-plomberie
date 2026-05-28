@@ -1,17 +1,31 @@
 import * as XLSX from 'xlsx';
+import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 
-const KEY = 'dpm_tender';
+GlobalWorkerOptions.workerSrc = new URL(
+  'pdfjs-dist/legacy/build/pdf.worker.min.mjs',
+  import.meta.url
+).toString();
+
+function readFileAsArrayBuffer(file) {
+  if (file && typeof file.arrayBuffer === 'function') {
+    return file.arrayBuffer().catch(() => readFileAsArrayBufferFallback(file));
+  }
+  return readFileAsArrayBufferFallback(file);
+}
+
+function readFileAsArrayBufferFallback(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('Impossible de lire le fichier.'));
+    reader.readAsArrayBuffer(file);
+  });
+}
 
 // ─── CCTP PARSING ─────────────────────────────────────────────────────────────
 
 export async function parseCCTPText(file) {
-  const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist/legacy/build/pdf.mjs');
-  GlobalWorkerOptions.workerSrc = new URL(
-    'pdfjs-dist/legacy/build/pdf.worker.min.mjs',
-    import.meta.url
-  ).toString();
-
-  const arrayBuffer = await file.arrayBuffer();
+  const arrayBuffer = await readFileAsArrayBuffer(file);
   const pdf = await getDocument({ data: arrayBuffer }).promise;
   const allLines = [];
 
@@ -287,29 +301,89 @@ export function findQtyInCCTP(dpgfLine, cctpText) {
 const CURRENT_KEY  = 'dpm_tender_current';
 const HISTORY_KEY  = 'dpm_tender_list';
 const DATA_PREFIX  = 'dpm_tender_data_';
+const MAX_SAVED_CCTP_SPECS = 6;
+const MAX_SAVED_CCTP_SPEC_LENGTH = 180;
+const MAX_SAVED_CCTP_CONTEXT_LENGTH = 240;
+const MAX_SAVED_CCTP_BLOCK_LENGTH = 0;
+
+function truncateText(value, maxLength) {
+  const text = String(value ?? '').trim();
+  if (!text || maxLength <= 0) return '';
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+function compactTenderLineForStorage(line) {
+  const compactLine = { ...line };
+
+  if (Array.isArray(line?.cctpSpecs)) {
+    compactLine.cctpSpecs = line.cctpSpecs
+      .map((spec) => truncateText(spec, MAX_SAVED_CCTP_SPEC_LENGTH))
+      .filter(Boolean)
+      .slice(0, MAX_SAVED_CCTP_SPECS);
+  }
+
+  if ('cctpContext' in compactLine) {
+    compactLine.cctpContext = truncateText(compactLine.cctpContext, MAX_SAVED_CCTP_CONTEXT_LENGTH);
+  }
+
+  if ('cctpBlock' in compactLine) {
+    compactLine.cctpBlock = truncateText(compactLine.cctpBlock, MAX_SAVED_CCTP_BLOCK_LENGTH);
+  }
+
+  return compactLine;
+}
+
+// Statuts du cycle de vie d'un appel d'offres
+export const TENDER_STATUSES = [
+  { id: 'in_progress', label: 'En cours',              color: '#2b6bff', bg: '#eaf1ff' },
+  { id: 'pending',     label: 'En attente de réponse', color: '#b76e00', bg: '#fff4e0' },
+  { id: 'won',         label: 'Validée',               color: '#0a7d44', bg: '#e0f6ea' },
+  { id: 'lost',        label: 'Perdue',                color: '#c93838', bg: '#fde4e4' },
+];
+
+export function getStatusMeta(statusId) {
+  return TENDER_STATUSES.find((s) => s.id === statusId) || TENDER_STATUSES[0];
+}
 
 export function saveTender(data) {
   const id = data.id || String(Date.now());
-  const normalized = { ...data, id, lines: data.lines ? normalizeTenderLines(data.lines) : [] };
+  const normalized = {
+    ...data,
+    id,
+    lines: data.lines ? normalizeTenderLines(data.lines).map(compactTenderLineForStorage) : [],
+  };
 
   localStorage.setItem(DATA_PREFIX + id, JSON.stringify(normalized));
   localStorage.setItem(CURRENT_KEY, id);
+
+  // Préserve le statut existant lors d'un re-save (édition), nouveau dossier = 'in_progress'
+  const list = loadTenderHistory();
+  const existing = list.find((h) => h.id === id);
 
   const meta = {
     id,
     projectName: data.projectName || 'Sans nom',
     dpgfFileName: data.dpgfFileName || '',
     savedAt: Date.now(),
+    status: data.status || existing?.status || 'in_progress',
     lineCount: (data.lines || []).filter(l => !l.isSection).length,
     totalHT: (data.lines || []).filter(l => !l.isSection)
       .reduce((s, l) => s + (l.quantite || 0) * (l.prixUnitaire || 0), 0),
   };
-  const list = loadTenderHistory();
   const idx = list.findIndex(h => h.id === id);
   if (idx >= 0) list[idx] = meta; else list.unshift(meta);
   localStorage.setItem(HISTORY_KEY, JSON.stringify(list.slice(0, 30)));
 
   return normalized;
+}
+
+export function updateTenderStatus(id, status) {
+  if (!TENDER_STATUSES.some((s) => s.id === status)) return;
+  const list = loadTenderHistory();
+  const idx = list.findIndex((h) => h.id === id);
+  if (idx < 0) return;
+  list[idx] = { ...list[idx], status };
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
 }
 
 export function loadTender() {
@@ -363,14 +437,6 @@ export function clearTender() {
       C: ["",     "",                 "Description detail", "u",  qty, pu, total]
 */
 
-// Unit abbreviations typical in French DPGFs
-const UNITS = new Set(['ens','u','u.','ml','ml.','m','m²','m2','m3','m³','kg','t','h','heure','heures','mois','jour','jours','ff','forfait','nb','nbr','pce','pièce','piece','pm']);
-
-const isUnit = (v) => {
-  const s = String(v ?? '').trim().toLowerCase().replace(/\.+$/, '');
-  return UNITS.has(s) || /^m[²2³3]?$/.test(s);
-};
-
 const toNum = (v) => {
   if (v === '' || v === null || v === undefined) return null;
   const n = parseFloat(String(v).replace(/\s/g, '').replace(',', '.'));
@@ -415,7 +481,7 @@ function mapColumns(headerRow) {
 
 // Infer columns for files where headers have no description label
 // (e.g., ["", "", "", "U", "Qté", "PU", "Total HT"])
-function inferDescColumns(rows, headerIdx, cols) {
+function inferDescColumns(cols) {
   if (cols.unite === -1) return;
 
   // Columns before the unit column are likely: num / desc / desc
@@ -447,6 +513,31 @@ function uniqueNonEmpty(values) {
   return items;
 }
 
+function stripBulletPrefix(text) {
+  return String(text || '').replace(/^[-•●▪◦‣]\s*/, '').trim();
+}
+
+function extractLeadingQuantity(text) {
+  const cleaned = stripBulletPrefix(text);
+  const match = cleaned.match(/^(\d+(?:[.,]\d+)?)(?=\s*[a-zA-ZÀ-ÿ(])/);
+  if (!match) return null;
+  const quantity = parseFloat(match[1].replace(',', '.'));
+  return Number.isFinite(quantity) && quantity > 0 ? quantity : null;
+}
+
+function isBulletDetailRow(text) {
+  return /^[-•●▪◦‣]\s*/.test(String(text || '').trim());
+}
+
+function isContextDetailLine(text) {
+  const value = stripBulletPrefix(text);
+  if (!value) return false;
+  if (isBulletDetailRow(text)) return true;
+  if (/^\d+\s+[a-zA-ZÀ-ÿ]/.test(value)) return true;
+  if (value.length > 90) return true;
+  return false;
+}
+
 function fallbackDescription(line) {
   const specs = Array.isArray(line?.cctpSpecs) ? line.cctpSpecs : [];
   return String(
@@ -460,10 +551,27 @@ function fallbackDescription(line) {
 function normalizeTenderLines(lines) {
   return (Array.isArray(lines) ? lines : []).map((line) => {
     const description = fallbackDescription(line);
+    const isLegacyBulletRow = !!line?.isSection && isBulletDetailRow(description);
+    const isSection = isLegacyBulletRow ? false : !!line?.isSection;
+    const extractedQty = !isSection && (!line?.quantite || line?.quantite === 0)
+      ? extractLeadingQuantity(description)
+      : null;
+    let finalQty = extractedQty ?? (line?.quantite ?? 0);
+    let qtySources = extractedQty !== null ? 'desc' : (line?.qtySources ?? null);
+
+    if (!isSection && finalQty === 0 && isBulletDetailRow(description)) {
+      finalQty = 1;
+      qtySources = qtySources || 'implicit';
+    }
+
     return {
       ...line,
       description,
-      totalHT: (line?.quantite ?? 0) * (line?.prixUnitaire ?? 0),
+      isSection,
+      quantite: finalQty,
+      qtyFromDesc: extractedQty !== null ? true : !!line?.qtyFromDesc,
+      qtySources,
+      totalHT: finalQty * (line?.prixUnitaire ?? 0),
     };
   });
 }
@@ -504,7 +612,7 @@ function parseSheet(rows) {
   if (hi === -1) return null;
 
   const cols = mapColumns(rows[hi]);
-  inferDescColumns(rows, hi, cols);
+  inferDescColumns(cols);
 
   // At minimum we need a description column and one structural clue
   const hasDescriptionColumn = cols.desc0 >= 0 || cols.desc1 >= 0 || cols.desc2 >= 0;
@@ -512,6 +620,8 @@ function parseSheet(rows) {
   if (!hasDescriptionColumn || !hasStructuredColumn) return null;
 
   const lines = [];
+  let currentContextTitle = '';
+  let currentContextDetails = [];
 
   for (let r = hi + 1; r < rows.length; r++) {
     const row = rows[r];
@@ -537,35 +647,82 @@ function parseSheet(rows) {
     const hasUnit  = unite && !unitLower.includes('à renseigner') && !unitLower.includes('renseigner');
     const hasPrice = pu !== null;
     const hasQty   = qty !== null;
-    const isSection = !hasUnit && !hasPrice && !hasQty;
+    const isBulletDetail = isBulletDetailRow(desc);
+    const isSection = !isBulletDetail && !hasUnit && !hasPrice && !hasQty;
+
+    if (isSection) {
+      if (isContextDetailLine(desc)) {
+        currentContextDetails.push(stripBulletPrefix(desc));
+      } else {
+        currentContextTitle = desc;
+        currentContextDetails = [];
+      }
+    }
 
     // Auto-extract quantity from description when DPGF qty is blank
     // e.g. "4 bennes à gravats 15 m3" → qty = 4
     let qtyFromDesc = false;
     let finalQty = qty ?? 0;
     if (!isSection && (qty === null || qty === 0)) {
-      const m = desc.match(/^(\d+(?:[.,]\d+)?)\s+[a-zA-ZÀ-ÿ]/);
-      if (m) {
-        const extracted = parseFloat(m[1].replace(',', '.'));
-        if (extracted > 0) {
-          finalQty = extracted;
-          qtyFromDesc = true;
+      const extracted = extractLeadingQuantity(desc);
+      if (extracted !== null) {
+        finalQty = extracted;
+        qtyFromDesc = true;
+      } else {
+        const contextualExtracted = currentContextDetails
+          .map(extractLeadingQuantity)
+          .find((value) => value !== null);
+        if (contextualExtracted !== undefined) {
+          finalQty = contextualExtracted ?? 0;
+          qtyFromDesc = contextualExtracted !== null;
         }
       }
     }
+
+    // For bullet-point item rows with no explicit quantity, default to 1
+    // so they remain actionable DPGF lines instead of inert section rows.
+    let qtySources = qtyFromDesc ? 'desc' : null;
+    if (!isSection && finalQty === 0 && isBulletDetail) {
+      finalQty = 1;
+      qtySources = 'implicit';
+    }
+
+    if (!isSection && !qtyFromDesc && (!qty || qty === 0) && /^pm$/i.test(unite.trim())) {
+      const contextualExtracted = currentContextDetails
+        .map(extractLeadingQuantity)
+        .find((value) => value !== null);
+      if (contextualExtracted !== undefined && contextualExtracted !== null) {
+        finalQty = contextualExtracted;
+        qtyFromDesc = true;
+        qtySources = 'desc';
+      }
+    }
+
+    const contextualParts = uniqueNonEmpty([
+      currentContextTitle,
+      ...currentContextDetails,
+      desc,
+    ]);
 
     lines.push({
       id: r,
       num,
       description: desc,
+      matchText: contextualParts.join(' — '),
+      contextTitle: currentContextTitle,
+      contextDetails: currentContextDetails.slice(0, 12),
       unite: hasUnit ? unite : '',
       quantite: finalQty,
       prixUnitaire: pu ?? 0,
       totalHT: finalQty * (pu ?? 0),
       isSection,
       qtyFromDesc,
-      qtySources: qtyFromDesc ? 'desc' : null,
+      qtySources,
     });
+
+    if (!isSection && (hasUnit || hasQty || hasPrice)) {
+      currentContextDetails = [];
+    }
   }
 
   return lines.length > 0 ? { lines: normalizeTenderLines(lines), headerRow: hi, cols } : null;

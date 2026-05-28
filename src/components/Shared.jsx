@@ -26,12 +26,12 @@ const CRM_ITEMS = [
   { to: "/crm/settings",    label: "Paramètres",     ic: "settings"},
 ];
 
-export function Sidebar({ counts = {} }) {
+export function Sidebar() {
   const location = useLocation();
   const onCrm = location.pathname.startsWith('/crm');
   const [crmOpen, setCrmOpen] = useState(onCrm);
 
-  const item = (to, id, label, ic, count) => (
+  const item = (to, label, ic, count) => (
     <NavLink to={to} className={({ isActive }) => "nav-item" + (isActive ? " active" : "")}>
       {ic}
       <span>{label}</span>
@@ -47,8 +47,8 @@ export function Sidebar({ counts = {} }) {
       </div>
 
       <div className="nav-label">Travail</div>
-      {item("/tender", "tender", "Appels d'offres", Icons.building)}
-      {item("/catalog", "catalog", "Base produits", Icons.package)}
+      {item("/tender", "Appels d'offres", Icons.building)}
+      {item("/catalog", "Base produits", Icons.package)}
 
       {/* Prospection — accordéon */}
       <button
@@ -73,12 +73,8 @@ export function Sidebar({ counts = {} }) {
         </div>
       )}
 
-      <div className="nav-label">Modules IA</div>
-      {item("/quotes", "quotes-pro", "Devis pro", Icons.sparkle, counts.quotes ?? 7)}
-
       <div className="nav-label">Aperçu</div>
-      {item("/dashboard", "dashboard", "Tableau de bord", Icons.chart)}
-      {item("/exec", "exec", "Vue exécutive", Icons.bolt)}
+      {item("/exec", "Vue exécutive", Icons.bolt)}
 
       <div className="sidebar-footer">
         <div className="avatar">DM</div>
