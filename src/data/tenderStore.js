@@ -446,12 +446,12 @@ const toNum = (v) => {
 // Find the header row in the first part of the workbook.
 // Some DPGFs have a long preamble and only expose the real table header much later.
 function findHeaderRow(rows) {
-  const qtyKw   = ['qté', 'qte', 'qt.', 'quantité', 'quantite', 'nombre', 'nbre'];
-  const priceKw = ['pu', 'p.u.', 'p.u', 'prix unitaire', 'prix unit', 'unitaire', 'montant', 'total ht', 'total h.t'];
+  const qtyKw   = ['qté', 'qte', 'qt.', 'quantité', 'quantite', 'nombre', 'nbre', 'nb'];
+  const priceKw = ['pu', 'p.u.', 'p.u', 'prix unitaire', 'prix unit', 'prix / u', 'prix/u', 'pu ht', 'p.u. ht', 'prix ht', 'unitaire', 'montant', 'total ht', 'total h.t'];
   const unitKw  = ['u', 'u.', 'unité', 'unite'];
-  const descKw  = ['description', 'désignation', 'designation', 'libellé', 'libelle', 'nature', 'ouvrage', 'travaux'];
+  const descKw  = ['description', 'désignation', 'designation', 'libellé', 'libelle', 'nature', 'ouvrage', 'travaux', 'intitulé', 'intitule'];
 
-  for (let i = 0; i < Math.min(250, rows.length); i++) {
+  for (let i = 0; i < Math.min(500, rows.length); i++) {
     const cells = rows[i].map(c => String(c ?? '').toLowerCase().trim());
     const hasQty   = cells.some(c => qtyKw.some(k => c === k || c.startsWith(k)));
     const hasPrice = cells.some(c => priceKw.some(k => c === k || c.includes(k)));
@@ -468,12 +468,12 @@ function mapColumns(headerRow) {
 
   headerRow.forEach((cell, i) => {
     const c = String(cell ?? '').toLowerCase().trim();
-    if      (c.match(/^u$|^unité$|^unite$|^u\.$/))                             map.unite = i;
-    else if (c.match(/^qté$|^qte$|^qt\.?$|quantité|quantite|^nb(r)?e?$/))     map.quantite = i;
-    else if (c.match(/^pu$|^p\.u\.?$|prix.unit|^unitaire$/))                   map.prixUnitaire = i;
-    else if (c.match(/total|montant/))                                          map.total = i;
-    else if (c.match(/désign|descript|libellé|libelle|nature|ouvrage|travaux|désignation/)) map.desc0 = i;
-    else if (c.match(/^n[°o]$|repère|repere|^article$|^poste$/))              map.num = i;
+    if      (c.match(/^u$|^unité$|^unite$|^u\.$/))                                                    map.unite = i;
+    else if (c.match(/^qté$|^qte$|^qt\.?$|quantité|quantite|^nb(r)?e?$/))                            map.quantite = i;
+    else if (c.match(/^pu$|^p\.u\.?$|prix.{0,5}unit|^unitaire$|^pu.?ht$|^p\.u\.?.?ht$|^prix.?ht$/)) map.prixUnitaire = i;
+    else if (c.match(/total|montant/))                                                                  map.total = i;
+    else if (c.match(/désign|descript|libellé|libelle|nature|ouvrage|travaux|intitulé|intitule/))     map.desc0 = i;
+    else if (c.match(/^n[°o]$|^n[°o]\s*poste|repère|repere|^article$|^poste$/))                      map.num = i;
   });
 
   return map;
